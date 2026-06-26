@@ -1,0 +1,13 @@
+[project]
+name = "hiob-core"
+version = "0.1.0"
+description = "HIOB 공유 런타임 — LLM 런타임·모델 프로바이더·platform 헬퍼. 전 행성이 depend하는 published 패키지(폴리레포 Phase 0.2)."
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hiob_core*"]
