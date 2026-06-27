@@ -11,6 +11,10 @@ requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = [
     "hiob-platform @ git+https://github.com/ksurahan-source/hiob-platform.git",
+    "anthropic",
+    "httpx",
+    "openai",
+    "supabase",
 ]
 
 [project.optional-dependencies]
