@@ -1,4 +1,11 @@
-"""Hiob agent-native video platform SDK."""
+"""Hiob agent-native video platform SDK.
+
+⚠️ 거버넌스 경계 (2026-06-27 감사 W2/W5): 이 모듈은 hiob_platform raw 헬퍼를 재수출한다.
+shared 테이블 WRITE(hook·artifact·audio·capi_event·reel_metric 등)는 직접 `.table().insert/
+update/upsert/delete` 대신 **hiob_data.DataGovernor 경유**가 원칙 — owner_planet·beat_index·
+PIPA 결박 강제. 신규 직접 write는 `infra/polyrepo/db_write_guard.py`(QA Gate #5)가 차단한다
+(베이스라인 108 → 0 수렴). 읽기/일회성 스크립트는 예외.
+"""
 from hiob_platform.client import get_service_client
 from hiob_platform.runs import (
     APPROVED_SCRIPT_STATUSES,

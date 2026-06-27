@@ -20,7 +20,23 @@ from openai import OpenAI
 # Prompt loading — prompts live in git, not in DB.
 # --------------------------------------------------------------------
 
-_PROMPT_DIR = Path(__file__).resolve().parent.parent.parent.parent / "apps" / "modal" / "prompts"
+def _resolve_prompt_dir() -> Path:
+    """Locate the prompts dir across environments (this package is imported from many roots):
+    HIOB_PROMPT_DIR override → Modal image /root/prompts → walk up to apps/modal/prompts (local)."""
+    env = os.environ.get("HIOB_PROMPT_DIR")
+    if env and Path(env).is_dir():
+        return Path(env)
+    root_prompts = Path("/root/prompts")  # Modal image: prompts copied here at build
+    if root_prompts.is_dir():
+        return root_prompts
+    for parent in Path(__file__).resolve().parents:  # local/dev: find the repo's apps/modal/prompts
+        cand = parent / "apps" / "modal" / "prompts"
+        if cand.is_dir():
+            return cand
+    return root_prompts  # default (load_prompt fails soft to "" if absent)
+
+
+_PROMPT_DIR = _resolve_prompt_dir()
 _PROMPT_CACHE: dict[str, str] = {}
 
 
