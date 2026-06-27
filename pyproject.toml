@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hiob-core"
 version = "0.1.0"
-description = "HIOB polyrepo · hiob-core"
+description = "HIOB polyrepo planet · hiob-core"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -14,11 +14,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "import-linter>=2.0"]
+dev = ["pytest>=7.0"]
 
 [tool.setuptools]
 packages = ["hiob_core"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
