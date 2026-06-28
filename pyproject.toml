@@ -6,7 +6,7 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 # substrate = plain 이름(소비자 root sources가 git 해소). hiob-platform은 substrate 동급.
 dependencies = [
-    "hiob-platform",
+    "hiob-platform @ git+https://github.com/ksurahan-source/hiob-platform.git@main",
     "httpx",
     "openai",
     "supabase",
