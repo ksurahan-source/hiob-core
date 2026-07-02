@@ -37,12 +37,21 @@ SCRIPT_MODELS: dict[str, dict[str, Any]] = {
         "id": "gpt", "label": "GPT-4o", "provider": "openai",
         "model": "gpt-4o", "env": "OPENAI_API_KEY", "status": "live",
     },
+    "qwen": {
+        # 도쿄 워크스페이스 실존 모델(콘솔 실측 2026-07-02): qwen3.7-max/plus·qwen3.6-plus/flash.
+        # qwen3-max는 이 리전에 없음 — 기본은 최상급 qwen3.7-max, env로 오버라이드.
+        "id": "qwen", "label": "Qwen (3.7-max · Tokyo)", "provider": "qwen",
+        "model": os.environ.get("HIOB_QWEN_SCRIPT_MODEL", "qwen3.7-max"),
+        "env": "DASHSCOPE_API_KEY", "status": "dormant",
+        "base_url_env": "QWEN_OPENAI_BASE", "base_url_default": "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1",
+    },
 }
 DEFAULT_SCRIPT_MODEL = "claude"
 
 _SCRIPT_ALIASES = {
     "claude-opus-4-8": "claude", "opus": "claude", "anthropic": "claude",
     "gpt-4o": "gpt", "gpt4o": "gpt", "openai": "gpt", "chatgpt": "gpt",
+    "qwen": "qwen", "qwen3": "qwen", "qwen3-max": "qwen", "qwen3.7-max": "qwen", "qwen3.7-plus": "qwen",
 }
 
 # ── INTERPRET models (the 요청 해석 / "talk" LLM) ─────────────────────────────

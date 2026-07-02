@@ -294,7 +294,7 @@ def llm_json(
     on_partial: callable | None = None,
     temperature: float | None = None,
 ) -> tuple[dict, int, int]:
-    """Call OpenAI or Anthropic; return (parsed_json, tokens_in, tokens_out).
+    """Call OpenAI, Anthropic, Gemini, or Qwen; return (parsed_json, tokens_in, tokens_out).
 
     on_partial(text_so_far) is called with the cumulative stream so the
     orchestrator can incrementally persist `agent_call.output_preview`
@@ -307,7 +307,7 @@ def llm_json(
         return _anthropic_json(system=system, user=user, model=model, temperature=temperature)
 
     # Gemini via its OpenAI-compatible endpoint (founder-provided key). Used by url_ingest
-    # for cheap long-context extraction; falls through to OpenAI for everything else.
+    # for cheap long-context extraction.
     if model.startswith("gemini"):
         gclient = OpenAI(
             api_key=os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", ""),
@@ -332,6 +332,38 @@ def llm_json(
             gusage.completion_tokens if gusage else 0,
         )
 
+    # Qwen via Tokyo workspace OpenAI-compatible endpoint
+    if model.startswith("qwen"):
+        qwen_client = OpenAI(
+            api_key=os.environ.get("DASHSCOPE_API_KEY", ""),
+            base_url=os.environ.get(
+                "QWEN_OPENAI_BASE",
+                "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1"
+            ),
+        )
+        qkwargs = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "response_format": {"type": "json_object"},
+            # qwen3.7 계열은 사고형(reasoning) 기본 ON — JSON 산출에는 불필요한 토큰이라 끈다.
+            # (도쿄 compatible-mode 실측 2026-07-02: enable_thinking:false + json_object 조합 정상)
+            "extra_body": {"enable_thinking": False},
+        }
+        if temperature is not None:
+            qkwargs["temperature"] = temperature
+        qresp = qwen_client.chat.completions.create(**qkwargs)
+        qraw = qresp.choices[0].message.content or "{}"
+        qusage = qresp.usage
+        return (
+            _parse_json_text(qraw),
+            qusage.prompt_tokens if qusage else 0,
+            qusage.completion_tokens if qusage else 0,
+        )
+
+    # Default: OpenAI (includes GPT and other OpenAI models)
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
     if on_partial is None:
