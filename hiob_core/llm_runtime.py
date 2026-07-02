@@ -81,7 +81,7 @@ def load_localized_prompt(name: str, locale: str | None) -> str:
 TIER_ENV = {
     "cheap":   ("HIOB_CHEAP_MODEL",   "claude-haiku-4-5"),
     "default": ("HIOB_DEFAULT_MODEL", "claude-sonnet-4-6"),
-    "premium": ("HIOB_PREMIUM_MODEL", "claude-opus-4-8"),
+    "premium": ("HIOB_PREMIUM_MODEL", "qwen3.7-max"),  # founder 2026-07-03: 전 모델 Qwen 단일화 (Claude 중지, env로만 복귀)
 }
 
 
@@ -423,7 +423,7 @@ def llm_json(
     return _parse_json_text(raw), tokens_in, tokens_out
 
 
-def llm_vision_json(*, system: str, user: str, image_urls: list[str], model: str = "gpt-4o") -> tuple[dict, int, int]:
+def llm_vision_json(*, system: str, user: str, image_urls: list[str], model: str = "qwen3.7-plus") -> tuple[dict, int, int]:
     """VISION — let a vision model SEE image_urls and return JSON. Used so the agent reads the
     brand's UPLOADED images to understand the brand's own content. Caps at 8 images. Routes to
     Claude vision when `model` is a claude-* id (LOOP_STUDIO: Opus is the only brain — no gpt-4o
@@ -431,6 +431,33 @@ def llm_vision_json(*, system: str, user: str, image_urls: list[str], model: str
     urls = [u for u in (image_urls or []) if u][:8]
     if _is_claude_model(model):
         return _anthropic_vision_json(system=system, user=user, image_urls=urls, model=model)
+    # QWEN-VISION (founder 2026-07-03 "qwen vl이 opus보다 훨씬 잘한다 — 실험 끝"):
+    # 도쿄 워크스페이스 OpenAI-호환으로 이미지 판독. 텍스트 qwen 분기와 동일 클라이언트 구성,
+    # qwen3.7-plus=네이티브 멀티모달(비전 포함) — 정밀 grounding 필요 시 HIOB_VISION_MODEL로 교체.
+    if model.startswith("qwen"):
+        qclient = OpenAI(
+            api_key=os.environ.get("DASHSCOPE_API_KEY", ""),
+            base_url=os.environ.get(
+                "QWEN_OPENAI_BASE",
+                "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1",
+            ),
+        )
+        qcontent: list[dict] = [{"type": "text", "text": user}]
+        for url in urls:
+            qcontent.append({"type": "image_url", "image_url": {"url": url}})
+        qresp = qclient.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": qcontent}],
+            response_format={"type": "json_object"},
+            extra_body={"enable_thinking": False},
+        )
+        qraw = qresp.choices[0].message.content or "{}"
+        qusage = qresp.usage
+        return (
+            _parse_json_text(qraw),
+            qusage.prompt_tokens if qusage else 0,
+            qusage.completion_tokens if qusage else 0,
+        )
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     content: list[dict] = [{"type": "text", "text": user}]
     for url in urls:
