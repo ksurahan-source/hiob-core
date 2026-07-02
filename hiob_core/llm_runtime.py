@@ -78,10 +78,16 @@ def load_localized_prompt(name: str, locale: str | None) -> str:
 # Defaults are Claude-first, routed by seniority of judgment:
 #   premium = Opus 4.8 (creative brain) · default = Sonnet 4.6 · cheap = Haiku 4.5.
 # Set HIOB_*_MODEL in the Modal secret to override without a code change.
+# QWEN 3티어 전략 (founder 2026-07-03 D-46 — "작은 모델뿐이라 어디에 뭘 쓸지 전략적으로"):
+#   premium = qwen3.7-max   (600rpm·1M tpm)   — 창의 대작업: 대본·아트·마케터·편집장·팀장·사운드
+#                                               (릴당 ~8콜, TPM 수학상 동시 5-6릴까지 안전)
+#   default = qwen3.7-plus  (15,000rpm·5M tpm) — 워크호스: PD·리서처·비주얼에디터 + 비전 겸용
+#   cheap   = qwen3.6-flash (15,000rpm·10M tpm)— 대량 경량: QA·선곡 판단·헬퍼 배치
+# Claude/GPT 복귀는 env 오버라이드만 (코드 기본은 Qwen 단일).
 TIER_ENV = {
-    "cheap":   ("HIOB_CHEAP_MODEL",   "claude-haiku-4-5"),
-    "default": ("HIOB_DEFAULT_MODEL", "claude-sonnet-4-6"),
-    "premium": ("HIOB_PREMIUM_MODEL", "qwen3.7-max"),  # founder 2026-07-03: 전 모델 Qwen 단일화 (Claude 중지, env로만 복귀)
+    "cheap":   ("HIOB_CHEAP_MODEL",   "qwen3.6-flash"),
+    "default": ("HIOB_DEFAULT_MODEL", "qwen3.7-plus"),
+    "premium": ("HIOB_PREMIUM_MODEL", "qwen3.7-max"),
 }
 
 
@@ -95,7 +101,7 @@ def resolve_model(role_row: dict | None) -> tuple[str, str]:
       4. fallback to HIOB_DEFAULT_MODEL (Sonnet 4.6)
     """
     if not role_row:
-        return os.environ.get("HIOB_DEFAULT_MODEL", "claude-sonnet-4-6"), "default"
+        return os.environ.get("HIOB_DEFAULT_MODEL", "qwen3.7-plus"), "default"
 
     attrs = role_row.get("attributes") or {}
     if isinstance(attrs, dict) and attrs.get("model_override"):
