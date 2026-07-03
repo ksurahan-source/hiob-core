@@ -363,11 +363,43 @@ def llm_json(
         qresp = qwen_client.chat.completions.create(**qkwargs)
         qraw = qresp.choices[0].message.content or "{}"
         qusage = qresp.usage
-        return (
-            _parse_json_text(qraw),
-            qusage.prompt_tokens if qusage else 0,
-            qusage.completion_tokens if qusage else 0,
-        )
+        q_in = qusage.prompt_tokens if qusage else 0
+        q_out = qusage.completion_tokens if qusage else 0
+        try:
+            return (_parse_json_text(qraw), q_in, q_out)
+        except json.JSONDecodeError:
+            # D-46 이후 유일한 프로덕션 경로가 qwen인데 repair는 Claude 전용이었다(2026-07-03 감사).
+            # 동일 엔드포인트 1회 결정론 수리 — 실패 시 원 예외 대신 JsonRepairError로 승격.
+            rkwargs = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": (
+                        "You repair malformed JSON. Return only one syntactically valid JSON object. "
+                        "Do not add markdown, explanation, comments, or fields not implied by the input."
+                    )},
+                    {"role": "user", "content": (
+                        "Repair this malformed JSON object so json.loads can parse it. "
+                        "Preserve Korean text and field names exactly where possible.\n\n" + (qraw or "")
+                    )},
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0,
+                "extra_body": {"enable_thinking": False},
+            }
+            rresp = qwen_client.chat.completions.create(**rkwargs)
+            rraw = rresp.choices[0].message.content or "{}"
+            rusage = rresp.usage
+            r_in = rusage.prompt_tokens if rusage else 0
+            r_out = rusage.completion_tokens if rusage else 0
+            try:
+                parsed = _require_json_object(_parse_json_text(rraw), source="Qwen JSON repair")
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise JsonRepairError(
+                    "Qwen JSON repair failed to return a valid JSON object",
+                    tokens_in=q_in + r_in,
+                    tokens_out=q_out + r_out,
+                ) from exc
+            return (parsed, q_in + r_in, q_out + r_out)
 
     # Default: OpenAI (includes GPT and other OpenAI models)
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
