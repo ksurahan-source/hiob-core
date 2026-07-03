@@ -61,6 +61,10 @@ _SCRIPT_ALIASES = {
 # Keeping this independent of SCRIPT_MODELS means choosing GPT for the brief does
 # NOT change who reads the customer request (default: always Sonnet 4.6).
 INTERPRET_MODELS: dict[str, dict[str, Any]] = {
+    "qwen": {
+        "id": "qwen", "label": "Qwen 3.7 Plus", "provider": "qwen",
+        "model": "qwen3.7-plus", "env": "DASHSCOPE_API_KEY", "status": "live",
+    },
     "sonnet": {
         "id": "sonnet", "label": "Claude (Sonnet 4.6)", "provider": "anthropic",
         "model": "claude-sonnet-4-6", "env": "ANTHROPIC_API_KEY", "status": "live",
@@ -70,11 +74,15 @@ INTERPRET_MODELS: dict[str, dict[str, Any]] = {
         "model": "gpt-4o-mini", "env": "OPENAI_API_KEY", "status": "live",
     },
 }
-DEFAULT_INTERPRET_MODEL = "sonnet"
+# D-46 (2026-07-03 fact-check): interpret은 dead code가 아니라 hiob_atropos.interpret이
+# 실사용 중이었고 기본이 sonnet이었다 — 텍스트 전부 Qwen 결정에 맞춰 기본 교체.
+# sonnet/gpt는 brief.interpret_model 명시 오버라이드로만.
+DEFAULT_INTERPRET_MODEL = "qwen"
 
 _INTERPRET_ALIASES = {
     "claude-sonnet-4-6": "sonnet", "sonnet": "sonnet", "claude": "sonnet", "anthropic": "sonnet",
     "gpt-4o-mini": "gpt_mini", "gpt4o-mini": "gpt_mini", "gpt_mini": "gpt_mini", "mini": "gpt_mini",
+    "qwen3.7-plus": "qwen", "qwen": "qwen",
 }
 
 # ── ASSET engines (per-beat visuals: image or video) ────────────────────────
