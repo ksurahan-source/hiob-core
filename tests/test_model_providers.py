@@ -54,22 +54,22 @@ class TestInterpretModelResolution:
     """Test INTERPRET model selection (independent of SCRIPT)."""
 
     def test_resolve_interpret_model_default(self):
-        """None brief returns default (sonnet)."""
-        assert resolve_interpret_model(None) == "sonnet"
+        """None brief returns default (qwen per D-46: interpret 기본 sonnet→qwen3.7-plus)."""
+        assert resolve_interpret_model(None) == "qwen"
 
     def test_resolve_interpret_model_explicit(self):
         """brief.interpret_model overrides default."""
         assert resolve_interpret_model({"interpret_model": "gpt_mini"}) == "gpt_mini"
 
     def test_interpret_model_id(self):
-        """interpret_model_id returns provider string."""
-        assert interpret_model_id(None) == "claude-sonnet-4-6"
+        """interpret_model_id returns provider string (default qwen3.7-plus per D-46)."""
+        assert interpret_model_id(None) == "qwen3.7-plus"
         assert interpret_model_id({"interpret_model": "gpt_mini"}) == "gpt-4o-mini"
 
     def test_interpret_independent_of_script(self):
-        """Choosing GPT for script doesn't change interpret (stays Sonnet)."""
+        """Choosing GPT for script doesn't change interpret (stays default qwen per D-46)."""
         brief_gpt_script = {"script_model": "gpt"}
-        assert resolve_interpret_model(brief_gpt_script) == "sonnet"
+        assert resolve_interpret_model(brief_gpt_script) == "qwen"
 
 
 class TestAssetEngineResolution:
