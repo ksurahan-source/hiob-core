@@ -1,35 +1,16 @@
-"""Supabase service client for trusted server-side writes.
+"""Single source of truth = hiob_platform.client (LP10-1 dual-SSOT fix).
 
-Workers (Modal, Renderer) use the SECRET key — bypasses RLS.
+This module was an IDENTICAL copy of hiob_platform.client. Kept as a thin
+re-export shim so `from hiob_core.platform import client` and
+`from hiob_core.platform.client import …` keep working.
+
+Edit hiob_platform.client, never this file.
 """
 from __future__ import annotations
 
-import os
+import importlib
 
-from supabase import Client, create_client
+_src = importlib.import_module("hiob_platform.client")
 
-
-def _required(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise RuntimeError(f"{name} is not configured")
-    return value
-
-
-def _required_url() -> str:
-    """The Studio (Cloudflare Pages) uses NEXT_PUBLIC_SUPABASE_URL for the
-    browser bundle; Modal workers historically used SUPABASE_URL. Accept
-    either so the same secret payload works in both environments."""
-    for name in ("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL"):
-        value = os.environ.get(name)
-        if value:
-            return value
-    raise RuntimeError("SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) is not configured")
-
-
-def get_service_client() -> Client:
-    """Return a Supabase client authenticated with the service (secret) key.
-
-    Env: SUPABASE_URL | NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SECRET_KEY
-    """
-    return create_client(_required_url(), _required("SUPABASE_SECRET_KEY"))
+# Re-export every public + single-underscore name (workers may import privates).
+globals().update({k: getattr(_src, k) for k in dir(_src) if not k.startswith("__")})
