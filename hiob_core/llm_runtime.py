@@ -145,6 +145,23 @@ def estimate_cost_cents(model: str, tokens_in: int, tokens_out: int) -> float:
     return max(0.0, float(cents))
 
 
+def cost_line_item(model: str, tokens_in: int, tokens_out: int) -> dict:
+    """BFA-5: per-call cost line item for usage_event consumers.
+
+    Returns {model, tokens_in, tokens_out, est_cost} where est_cost is
+    estimate_cost_cents (USD cents float). Additive fields only.
+    """
+    tin = int(tokens_in or 0)
+    tout = int(tokens_out or 0)
+    m = str(model or "")
+    return {
+        "model": m,
+        "tokens_in": tin,
+        "tokens_out": tout,
+        "est_cost": estimate_cost_cents(m, tin, tout),
+    }
+
+
 def _is_claude_model(model: str) -> bool:
     return str(model or "").lower().startswith("claude")
 
