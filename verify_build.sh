@@ -49,7 +49,7 @@ python3 -c "
 import sys
 sys.path.insert(0, '.')
 from hiob_core.model_providers import resolve_script_model, resolve_asset_engine, engine_is_live
-assert resolve_script_model(None) == 'claude', 'Failed: resolve_script_model default'
+assert resolve_script_model(None) == 'qwen', 'Failed: resolve_script_model default (live qwen)'
 assert resolve_asset_engine(None) == 'openai_image', 'Failed: resolve_asset_engine default'
 print('  ✅ Core functions import and execute')
 "

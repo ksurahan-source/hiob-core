@@ -28,14 +28,15 @@ class TestScriptModelResolution:
     """Test SCRIPT model selection axis."""
 
     def test_resolve_script_model_default(self):
-        """None brief returns default (claude)."""
-        assert resolve_script_model(None) == "claude"
-        assert resolve_script_model({}) == "claude"
+        """None brief returns live default (qwen — cheap qwen3.7-max path, LP7-7)."""
+        assert resolve_script_model(None) == "qwen"
+        assert resolve_script_model({}) == "qwen"
 
     def test_resolve_script_model_explicit(self):
         """brief.script_model overrides default."""
         assert resolve_script_model({"script_model": "gpt"}) == "gpt"
         assert resolve_script_model({"script_llm": "gpt"}) == "gpt"
+        assert resolve_script_model({"script_model": "claude"}) == "claude"
 
     def test_normalize_script_model_aliases(self):
         """Aliases map to canonical ids."""
@@ -43,11 +44,20 @@ class TestScriptModelResolution:
         assert normalize_script_model("opus") == "claude"
         assert normalize_script_model("gpt-4o") == "gpt"
         assert normalize_script_model("gpt4o") == "gpt"
+        assert normalize_script_model("qwen3.7-max") == "qwen"
 
     def test_script_model_id(self):
-        """script_model_id returns provider string."""
-        assert script_model_id(None) == "claude-opus-4-8"
+        """script_model_id returns provider string via resolve_script_model SSOT."""
+        assert script_model_id(None) == "qwen3.7-max"
         assert script_model_id({"script_model": "gpt"}) == "gpt-4o"
+        assert script_model_id({"script_model": "claude"}) == "claude-opus-4-8"
+
+    def test_script_model_id_respects_claude_script_model_env(self, monkeypatch):
+        """CLAUDE_SCRIPT_MODEL env must not diverge from script_model_id (LP7-7)."""
+        monkeypatch.setenv("CLAUDE_SCRIPT_MODEL", "claude-sonnet-4-6")
+        assert script_model_id({"script_model": "claude"}) == "claude-sonnet-4-6"
+        # Default registry id stays qwen — env only affects the claude *string*.
+        assert resolve_script_model(None) == "qwen"
 
 
 class TestInterpretModelResolution:

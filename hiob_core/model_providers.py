@@ -19,8 +19,9 @@ is an adapter over the existing piapi_video client, not a new account.
 
 Resolution order: brief.script_model / brief.asset_engine (explicit per-reel) →
 style_mode default → global default. Unknown/blank ⇒ default (legacy image reel
-for branded). The axis is additive: with nothing set, behavior is byte-identical
-to the current Claude-script + OpenAI-image reel.
+for branded). Script model SSOT is resolve_script_model() / script_model_id()
+(LP7-7): live default registry id is qwen → provider model qwen3.7-max (cheap);
+frontier flip is §C-9 only. Asset default remains OpenAI-image for branded.
 """
 from __future__ import annotations
 
@@ -28,10 +29,21 @@ import os
 from typing import Any
 
 # ── SCRIPT models (the 기획서 LLM) ───────────────────────────────────────────
+# SSOT: call resolve_script_model() / script_model_id() — never fork model choice
+# via ad-hoc os.environ.get("CLAUDE_SCRIPT_MODEL") at call sites (LP7-7).
+# Provider model *strings* may still be env-overridden (below); the *registry id*
+# default is the cheap live path (qwen). Frontier flip is founder §C-9 only.
+def _env_model(name: str, default: str) -> str:
+    raw = (os.environ.get(name) or "").strip()
+    return raw or default
+
+
 SCRIPT_MODELS: dict[str, dict[str, Any]] = {
     "claude": {
         "id": "claude", "label": "Claude (Opus 4.8)", "provider": "anthropic",
-        "model": "claude-opus-4-8", "env": "ANTHROPIC_API_KEY", "status": "live",
+        # Historical env name CLAUDE_SCRIPT_MODEL = Anthropic model string override.
+        "model": _env_model("CLAUDE_SCRIPT_MODEL", "claude-opus-4-8"),
+        "env": "ANTHROPIC_API_KEY", "status": "live",
     },
     "gpt": {
         "id": "gpt", "label": "GPT-4o", "provider": "openai",
@@ -41,12 +53,15 @@ SCRIPT_MODELS: dict[str, dict[str, Any]] = {
         # 도쿄 워크스페이스 실존 모델(콘솔 실측 2026-07-02): qwen3.7-max/plus·qwen3.6-plus/flash.
         # qwen3-max는 이 리전에 없음 — 기본은 최상급 qwen3.7-max, env로 오버라이드.
         "id": "qwen", "label": "Qwen (3.7-max · Tokyo)", "provider": "qwen",
-        "model": os.environ.get("HIOB_QWEN_SCRIPT_MODEL", "qwen3.7-max"),
-        "env": "DASHSCOPE_API_KEY", "status": "dormant",
+        "model": _env_model("HIOB_QWEN_SCRIPT_MODEL", "qwen3.7-max"),
+        "env": "DASHSCOPE_API_KEY", "status": "live",
         "base_url_env": "QWEN_OPENAI_BASE", "base_url_default": "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1",
     },
 }
-DEFAULT_SCRIPT_MODEL = "claude"
+# Live production default = qwen (cheap · qwen3.7-max path). Do NOT flip to
+# opus/gpt here — that is §C-9 cost decision. DEFAULT_SCRIPT_MODEL is a registry
+# id, not a provider model string (provider string comes from script_model_id).
+DEFAULT_SCRIPT_MODEL = "qwen"
 
 _SCRIPT_ALIASES = {
     "claude-opus-4-8": "claude", "opus": "claude", "anthropic": "claude",
@@ -155,14 +170,29 @@ def normalize_script_model(value: Any) -> str | None:
 
 
 def resolve_script_model(brief: dict[str, Any] | None) -> str:
-    """Return a SCRIPT_MODELS id (never None — defaults to claude)."""
+    """Sole SSOT for SCRIPT registry id (never None — defaults to DEFAULT_SCRIPT_MODEL).
+
+    LP7-7: call sites must use this (or script_model_id) instead of reading
+    DEFAULT_SCRIPT_MODEL / CLAUDE_SCRIPT_MODEL independently — those two used to
+    diverge (registry key "claude" vs env model string "claude-opus-4-8" /
+    live qwen3.7-max). Resolution order: brief.script_model|script_llm → default.
+    """
     brief = brief if isinstance(brief, dict) else {}
     return normalize_script_model(brief.get("script_model") or brief.get("script_llm")) or DEFAULT_SCRIPT_MODEL
 
 
 def script_model_id(brief: dict[str, Any] | None) -> str:
-    """The provider model string (e.g. 'claude-opus-4-8') for llm_json(model=…)."""
-    return SCRIPT_MODELS[resolve_script_model(brief)]["model"]
+    """Provider model string for llm_json(model=…) — always via resolve_script_model.
+
+    Re-reads env so CLAUDE_SCRIPT_MODEL / HIOB_QWEN_SCRIPT_MODEL stay aligned with
+    the registry entry even if env changed after import (tests / Modal secrets).
+    """
+    mid = resolve_script_model(brief)
+    if mid == "claude":
+        return _env_model("CLAUDE_SCRIPT_MODEL", "claude-opus-4-8")
+    if mid == "qwen":
+        return _env_model("HIOB_QWEN_SCRIPT_MODEL", "qwen3.7-max")
+    return SCRIPT_MODELS[mid]["model"]
 
 
 def normalize_interpret_model(value: Any) -> str | None:
