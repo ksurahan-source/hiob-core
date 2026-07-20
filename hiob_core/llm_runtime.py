@@ -332,8 +332,9 @@ def llm_json(
     # Gemini via its OpenAI-compatible endpoint (founder-provided key). Used by url_ingest
     # for cheap long-context extraction.
     if model.startswith("gemini"):
+        from hiob_core.model_providers import require_llm_api_key
         gclient = OpenAI(
-            api_key=os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", ""),
+            api_key=require_llm_api_key(model, purpose="llm_json"),
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         )
         gkwargs = {
@@ -357,8 +358,11 @@ def llm_json(
 
     # Qwen via Tokyo workspace OpenAI-compatible endpoint
     if model.startswith("qwen"):
+        from hiob_core.model_providers import require_llm_api_key
         qwen_client = OpenAI(
-            api_key=os.environ.get("DASHSCOPE_API_KEY", ""),
+            # Fail-loud on empty DASHSCOPE_API_KEY — empty string produced opaque
+            # OpenAI-SDK 401 "No API-key provided." (dogfood job e25fb11d).
+            api_key=require_llm_api_key(model, purpose="llm_json"),
             base_url=os.environ.get(
                 "QWEN_OPENAI_BASE",
                 "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1"
@@ -419,7 +423,8 @@ def llm_json(
             return (parsed, q_in + r_in, q_out + r_out)
 
     # Default: OpenAI (includes GPT and other OpenAI models)
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    from hiob_core.model_providers import require_llm_api_key
+    client = OpenAI(api_key=require_llm_api_key(model, purpose="llm_json"))
 
     if on_partial is None:
         kwargs = {
@@ -490,8 +495,9 @@ def llm_vision_json(*, system: str, user: str, image_urls: list[str], model: str
     # 도쿄 워크스페이스 OpenAI-호환으로 이미지 판독. 텍스트 qwen 분기와 동일 클라이언트 구성,
     # qwen3.7-plus=네이티브 멀티모달(비전 포함) — 정밀 grounding 필요 시 HIOB_VISION_MODEL로 교체.
     if model.startswith("qwen"):
+        from hiob_core.model_providers import require_llm_api_key
         qclient = OpenAI(
-            api_key=os.environ.get("DASHSCOPE_API_KEY", ""),
+            api_key=require_llm_api_key(model, purpose="llm_vision_json"),
             base_url=os.environ.get(
                 "QWEN_OPENAI_BASE",
                 "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1",
@@ -513,7 +519,8 @@ def llm_vision_json(*, system: str, user: str, image_urls: list[str], model: str
             qusage.prompt_tokens if qusage else 0,
             qusage.completion_tokens if qusage else 0,
         )
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    from hiob_core.model_providers import require_llm_api_key
+    client = OpenAI(api_key=require_llm_api_key(model, purpose="llm_vision_json"))
     content: list[dict] = [{"type": "text", "text": user}]
     for url in urls:
         content.append({"type": "image_url", "image_url": {"url": url, "detail": "low"}})
@@ -534,7 +541,8 @@ def _anthropic_vision_json(*, system: str, user: str, image_urls: list[str], mod
         from anthropic import Anthropic  # type: ignore
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("anthropic package is required for Claude models") from exc
-    client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    from hiob_core.model_providers import require_llm_api_key
+    client = Anthropic(api_key=require_llm_api_key(model, purpose="llm_vision_json"))
     content: list[dict] = [{"type": "text", "text": user}]
     for url in image_urls:
         content.append({"type": "image", "source": {"type": "url", "url": url}})
@@ -670,8 +678,9 @@ def _anthropic_json(*, system: str, user: str, model: str, temperature: float | 
     # the whole script-candidates job, so the studio spun until its poll timeout.
     # Opus drafts can legitimately take 2-3 min, so default 300s with a single
     # retry — a genuine hang fails fast enough for the studio to surface it.
+    from hiob_core.model_providers import require_llm_api_key
     client = Anthropic(
-        api_key=os.environ["ANTHROPIC_API_KEY"],
+        api_key=require_llm_api_key(model, purpose="llm_json"),
         timeout=float(os.environ.get("ANTHROPIC_TIMEOUT_S", "300")),
         max_retries=int(os.environ.get("ANTHROPIC_MAX_RETRIES", "1")),
     )

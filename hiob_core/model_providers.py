@@ -248,3 +248,65 @@ def engine_is_live(engine_id: str) -> bool:
 
 def engine_produces_video(engine_id: str) -> bool:
     return ASSET_ENGINES.get(str(engine_id or ""), {}).get("kind") == "video"
+
+
+# ── Fail-loud LLM credential checks (script_candidates / llm_runtime) ─────────
+# Empty env (OPENAI_API_KEY="", DASHSCOPE_API_KEY missing) previously produced a
+# late OpenAI-SDK 401 "No API-key provided." after ~20s of work. Check BEFORE
+# paid/network work; never put secret values in the raised message.
+
+
+def env_names_for_llm_model(model: str) -> tuple[str, ...]:
+    """Env var name(s) required for the llm_json / llm_vision_json route of `model`.
+
+    First present non-empty wins (e.g. GEMINI_API_KEY or GOOGLE_API_KEY).
+    """
+    m = str(model or "").strip().lower()
+    if m.startswith("claude"):
+        return ("ANTHROPIC_API_KEY",)
+    if m.startswith("qwen"):
+        return ("DASHSCOPE_API_KEY",)
+    if m.startswith("gemini"):
+        return ("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    # OpenAI path (gpt-*, gpt-5.6-sol, and any unrouted default)
+    return ("OPENAI_API_KEY",)
+
+
+def llm_api_key_present(model: str) -> bool:
+    """True if at least one required env for this model is non-empty (after strip)."""
+    for name in env_names_for_llm_model(model):
+        if (os.environ.get(name) or "").strip():
+            return True
+    return False
+
+
+def require_llm_api_key(model: str, *, purpose: str = "script_candidates") -> str:
+    """Return the API key for `model`, or raise RuntimeError with a bilingual operator message.
+
+    Does NOT include secret values in the exception. Empty string counts as missing
+    (Modal secrets often ship KEY= which shadows and causes opaque 401s).
+    """
+    names = env_names_for_llm_model(model)
+    for name in names:
+        val = (os.environ.get(name) or "").strip()
+        if val:
+            return val
+    primary = names[0]
+    alts = " / ".join(names)
+    raise RuntimeError(
+        f"LLM_API_KEY_MISSING: {primary} is unset or empty "
+        f"(model={str(model or '')[:64] or '?'}, purpose={purpose}). "
+        f"Modal secret `hiob-env` must set {alts} (non-empty). "
+        f"{primary} 미설정 또는 빈 값 — Modal 시크릿 hiob-env에 실제 키를 넣으세요. "
+        f"(No API key value is printed.)"
+    )
+
+
+def require_script_llm_credentials(brief: dict[str, Any] | None = None) -> str:
+    """Resolve script model from brief and require its API key (fail-loud).
+
+    Returns the provider model string that will be used for llm_json.
+    """
+    mid = script_model_id(brief)
+    require_llm_api_key(mid, purpose="script_candidates")
+    return mid

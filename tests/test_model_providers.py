@@ -138,6 +138,42 @@ class TestEngineLifecycle:
         pass
 
 
+class TestLlmApiKeyFailLoud:
+    """Empty/missing provider keys must fail loud (no opaque OpenAI 401)."""
+
+    def test_env_names_for_routes(self):
+        from hiob_core.model_providers import env_names_for_llm_model
+        assert env_names_for_llm_model("qwen3.7-max") == ("DASHSCOPE_API_KEY",)
+        assert env_names_for_llm_model("claude-opus-4-8") == ("ANTHROPIC_API_KEY",)
+        assert env_names_for_llm_model("gpt-4o") == ("OPENAI_API_KEY",)
+        assert "GEMINI_API_KEY" in env_names_for_llm_model("gemini-2.0-flash")
+
+    def test_require_llm_api_key_missing(self, monkeypatch):
+        from hiob_core.model_providers import require_llm_api_key
+        monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+        monkeypatch.setenv("DASHSCOPE_API_KEY", "")  # empty shadows as missing
+        with pytest.raises(RuntimeError) as ei:
+            require_llm_api_key("qwen3.7-max", purpose="script_candidates")
+        msg = str(ei.value)
+        assert "LLM_API_KEY_MISSING" in msg
+        assert "DASHSCOPE_API_KEY" in msg
+        assert "미설정" in msg
+        # never echo a secret value
+        assert "sk-" not in msg
+
+    def test_require_llm_api_key_present(self, monkeypatch):
+        from hiob_core.model_providers import require_llm_api_key
+        monkeypatch.setenv("DASHSCOPE_API_KEY", "dash-test-not-real")
+        assert require_llm_api_key("qwen3.7-plus") == "dash-test-not-real"
+
+    def test_require_script_llm_credentials_default_qwen(self, monkeypatch):
+        from hiob_core.model_providers import require_script_llm_credentials
+        monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+        with pytest.raises(RuntimeError) as ei:
+            require_script_llm_credentials({})
+        assert "DASHSCOPE_API_KEY" in str(ei.value)
+
+
 class TestDataStructures:
     """Verify registries are well-formed."""
 
