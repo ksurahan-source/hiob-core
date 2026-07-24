@@ -21,6 +21,7 @@ from hiob_core.model_providers import (
     SCRIPT_MODELS,
     INTERPRET_MODELS,
     ASSET_ENGINES,
+    DEFAULT_ARES_XL_SCRIPT_MODEL,
 )
 
 
@@ -58,6 +59,46 @@ class TestScriptModelResolution:
         assert script_model_id({"script_model": "claude"}) == "claude-sonnet-4-6"
         # Default registry id stays qwen — env only affects the claude *string*.
         assert resolve_script_model(None) == "qwen"
+
+    def test_sealed_ares_xl_defaults_to_direct_openai(self, monkeypatch):
+        monkeypatch.delenv("HIOB_ARES_XL_SCRIPT_MODEL", raising=False)
+        brief = {
+            "ares_xl_jkpa_authority": {"status": "sealed"},
+            "script_model": "qwen",
+        }
+        assert DEFAULT_ARES_XL_SCRIPT_MODEL == "gpt-4o"
+        assert script_model_id(brief) == "gpt-4o"
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            "qwen3.7-max",
+            "claude-opus-4-8",
+            "gemini-2.0-flash",
+        ],
+    )
+    def test_sealed_ares_xl_respects_dedicated_provider_override(
+        self,
+        monkeypatch,
+        override,
+    ):
+        monkeypatch.setenv("HIOB_ARES_XL_SCRIPT_MODEL", override)
+        assert script_model_id(
+            {"ares_xl_jkpa_authority": {"status": "sealed"}}
+        ) == override
+
+    def test_non_xl_model_selection_is_unchanged_by_ares_xl_env(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HIOB_ARES_XL_SCRIPT_MODEL", "gpt-4o")
+        assert script_model_id(None) == "qwen3.7-max"
+        assert script_model_id({}) == "qwen3.7-max"
+        assert script_model_id({"script_model": "qwen"}) == "qwen3.7-max"
+        assert script_model_id({"script_model": "gpt"}) == "gpt-4o"
+        assert script_model_id({"script_model": "claude"}) == (
+            "claude-opus-4-8"
+        )
 
 
 class TestInterpretModelResolution:

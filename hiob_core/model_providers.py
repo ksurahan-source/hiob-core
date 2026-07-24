@@ -62,6 +62,7 @@ SCRIPT_MODELS: dict[str, dict[str, Any]] = {
 # opus/gpt here — that is §C-9 cost decision. DEFAULT_SCRIPT_MODEL is a registry
 # id, not a provider model string (provider string comes from script_model_id).
 DEFAULT_SCRIPT_MODEL = "qwen"
+DEFAULT_ARES_XL_SCRIPT_MODEL = SCRIPT_MODELS["gpt"]["model"]
 
 _SCRIPT_ALIASES = {
     "claude-opus-4-8": "claude", "opus": "claude", "anthropic": "claude",
@@ -186,7 +187,22 @@ def script_model_id(brief: dict[str, Any] | None) -> str:
 
     Re-reads env so CLAUDE_SCRIPT_MODEL / HIOB_QWEN_SCRIPT_MODEL stay aligned with
     the registry entry even if env changed after import (tests / Modal secrets).
+
+    A sealed Ares XL request has a separate paid-writer route. It must not inherit
+    the ordinary low-cost Qwen default because Qwen has no documented provider
+    request-identity transport for XL reconciliation. The dedicated env may still
+    explicitly select another provider; llm_runtime then enforces that provider's
+    fail-closed contract before HTTP.
     """
+    brief = brief if isinstance(brief, dict) else {}
+    if (
+        "ares_xl_jkpa_authority" in brief
+        and brief.get("ares_xl_jkpa_authority") is not None
+    ):
+        return _env_model(
+            "HIOB_ARES_XL_SCRIPT_MODEL",
+            DEFAULT_ARES_XL_SCRIPT_MODEL,
+        )
     mid = resolve_script_model(brief)
     if mid == "claude":
         return _env_model("CLAUDE_SCRIPT_MODEL", "claude-opus-4-8")

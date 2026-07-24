@@ -173,6 +173,108 @@ class JsonRepairError(ValueError):
         self.tokens_out = int(tokens_out or 0)
 
 
+class ProviderIdempotencyUnsupportedError(RuntimeError):
+    """The selected provider cannot safely bind the caller's operation key."""
+
+
+class ProviderRequestOptionUnsupportedError(RuntimeError):
+    """The selected provider cannot safely honor a requested call option."""
+
+
+def _validated_idempotency_key(idempotency_key: str | None) -> str | None:
+    """Validate keys before they can become provider request metadata."""
+    if idempotency_key is None:
+        return None
+    if not isinstance(idempotency_key, str):
+        raise TypeError("idempotency_key must be a string or None")
+    if not idempotency_key or idempotency_key != idempotency_key.strip():
+        raise ValueError(
+            "idempotency_key must be a non-empty string without surrounding whitespace"
+        )
+    try:
+        idempotency_key.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("idempotency_key must contain only ASCII characters") from exc
+    if len(idempotency_key) > 512:
+        raise ValueError("idempotency_key must be at most 512 ASCII characters")
+    return idempotency_key
+
+
+def _validated_max_completion_tokens(
+    max_completion_tokens: int | None,
+) -> int | None:
+    if max_completion_tokens is None:
+        return None
+    if isinstance(max_completion_tokens, bool) or not isinstance(
+        max_completion_tokens,
+        int,
+    ):
+        raise TypeError("max_completion_tokens must be an integer or None")
+    if max_completion_tokens <= 0:
+        raise ValueError("max_completion_tokens must be greater than zero")
+    return max_completion_tokens
+
+
+def _reject_unsupported_provider_idempotency(
+    *,
+    provider: str,
+    model: str,
+    idempotency_key: str | None,
+) -> None:
+    if idempotency_key is None:
+        return
+    raise ProviderIdempotencyUnsupportedError(
+        "PROVIDER_IDEMPOTENCY_UNSUPPORTED: "
+        f"{provider} model {model!r} has no documented caller-controlled "
+        "request identity transport for safe reconciliation; refusing the provider call"
+    )
+
+
+def _reject_unsupported_provider_option(
+    *,
+    provider: str,
+    model: str,
+    option: str,
+    value: Any,
+) -> None:
+    if value is None:
+        return
+    raise ProviderRequestOptionUnsupportedError(
+        "PROVIDER_REQUEST_OPTION_UNSUPPORTED: "
+        f"{provider} model {model!r} has no documented {option} mapping; "
+        "refusing the provider call"
+    )
+
+
+def _openai_client(
+    *,
+    api_key: str,
+    idempotency_key: str | None,
+    base_url: str | None = None,
+) -> Any:
+    """Construct every OpenAI-SDK adapter with the same reservation retry rule."""
+    kwargs: dict[str, Any] = {"api_key": api_key}
+    if base_url is not None:
+        kwargs["base_url"] = base_url
+    if idempotency_key is not None:
+        # A reserved call must remain one HTTP attempt across every SDK-backed
+        # adapter. Unknown outcomes return to the caller's reconcile boundary.
+        kwargs["max_retries"] = 0
+    return OpenAI(**kwargs)
+
+
+def _openai_request_options(idempotency_key: str | None) -> dict[str, Any]:
+    """Return the documented OpenAI request-correlation option for one attempt.
+
+    OpenAI Chat Completions does not document server-side deduplication for this
+    header. Callers must own the durable claim/reconcile contract. The adapter
+    disables SDK retries separately so an unknown response is not retried here.
+    """
+    if idempotency_key is None:
+        return {}
+    return {"extra_headers": {"X-Client-Request-Id": idempotency_key}}
+
+
 def _parse_json_text(raw: str) -> dict:
     raw = (raw or "{}").strip()
     try:
@@ -199,7 +301,13 @@ def _require_json_object(value: Any, *, source: str) -> dict:
     return value
 
 
-def _anthropic_repair_json_text(client: Any, *, model: str, raw: str) -> tuple[dict, int, int]:
+def _anthropic_repair_json_text(
+    client: Any,
+    *,
+    model: str,
+    raw: str,
+    max_completion_tokens: int | None = None,
+) -> tuple[dict, int, int]:
     """Repair a malformed Claude JSON response once.
 
     Claude usually obeys the raw-JSON instruction, but long script payloads can
@@ -208,7 +316,11 @@ def _anthropic_repair_json_text(client: Any, *, model: str, raw: str) -> tuple[d
     """
     resp = client.messages.create(
         model=model,
-        max_tokens=int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16000")),
+        max_tokens=(
+            max_completion_tokens
+            if max_completion_tokens is not None
+            else int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16000"))
+        ),
         temperature=0,
         system=(
             "You repair malformed JSON. Return only one syntactically valid JSON object. "
@@ -316,6 +428,8 @@ def llm_json(
     model: str,
     on_partial: callable | None = None,
     temperature: float | None = None,
+    idempotency_key: str | None = None,
+    max_completion_tokens: int | None = None,
 ) -> tuple[dict, int, int]:
     """Call OpenAI, Anthropic, Gemini, or Qwen; return (parsed_json, tokens_in, tokens_out).
 
@@ -325,16 +439,47 @@ def llm_json(
     blocking call.
 
     temperature: optional temperature for sampling (0.0-2.0). If None, uses model default.
+
+    idempotency_key: durable operation key owned by the caller. Direct OpenAI
+    requests send it as the documented X-Client-Request-Id and disable SDK
+    retries. Providers without a documented transport fail closed before HTTP.
+
+    max_completion_tokens: positive output-token cap. It maps to OpenAI
+    `max_completion_tokens` and Qwen/Anthropic `max_tokens`; undocumented
+    compatibility mappings fail closed.
     """
+    idempotency_key = _validated_idempotency_key(idempotency_key)
+    max_completion_tokens = _validated_max_completion_tokens(
+        max_completion_tokens
+    )
     if _is_claude_model(model):
-        return _anthropic_json(system=system, user=user, model=model, temperature=temperature)
+        return _anthropic_json(
+            system=system,
+            user=user,
+            model=model,
+            temperature=temperature,
+            idempotency_key=idempotency_key,
+            max_completion_tokens=max_completion_tokens,
+        )
 
     # Gemini via its OpenAI-compatible endpoint (founder-provided key). Used by url_ingest
     # for cheap long-context extraction.
     if model.startswith("gemini"):
+        _reject_unsupported_provider_idempotency(
+            provider="gemini",
+            model=model,
+            idempotency_key=idempotency_key,
+        )
+        _reject_unsupported_provider_option(
+            provider="gemini",
+            model=model,
+            option="max_completion_tokens",
+            value=max_completion_tokens,
+        )
         from hiob_core.model_providers import require_llm_api_key
-        gclient = OpenAI(
+        gclient = _openai_client(
             api_key=require_llm_api_key(model, purpose="llm_json"),
+            idempotency_key=idempotency_key,
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         )
         gkwargs = {
@@ -358,11 +503,17 @@ def llm_json(
 
     # Qwen via Tokyo workspace OpenAI-compatible endpoint
     if model.startswith("qwen"):
+        _reject_unsupported_provider_idempotency(
+            provider="qwen",
+            model=model,
+            idempotency_key=idempotency_key,
+        )
         from hiob_core.model_providers import require_llm_api_key
-        qwen_client = OpenAI(
+        qwen_client = _openai_client(
             # Fail-loud on empty DASHSCOPE_API_KEY — empty string produced opaque
             # OpenAI-SDK 401 "No API-key provided." (dogfood job e25fb11d).
             api_key=require_llm_api_key(model, purpose="llm_json"),
+            idempotency_key=idempotency_key,
             base_url=os.environ.get(
                 "QWEN_OPENAI_BASE",
                 "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1"
@@ -381,6 +532,8 @@ def llm_json(
         }
         if temperature is not None:
             qkwargs["temperature"] = temperature
+        if max_completion_tokens is not None:
+            qkwargs["max_tokens"] = max_completion_tokens
         qresp = qwen_client.chat.completions.create(**qkwargs)
         qraw = qresp.choices[0].message.content or "{}"
         qusage = qresp.usage
@@ -407,6 +560,8 @@ def llm_json(
                 "temperature": 0,
                 "extra_body": {"enable_thinking": False},
             }
+            if max_completion_tokens is not None:
+                rkwargs["max_tokens"] = max_completion_tokens
             rresp = qwen_client.chat.completions.create(**rkwargs)
             rraw = rresp.choices[0].message.content or "{}"
             rusage = rresp.usage
@@ -424,7 +579,10 @@ def llm_json(
 
     # Default: OpenAI (includes GPT and other OpenAI models)
     from hiob_core.model_providers import require_llm_api_key
-    client = OpenAI(api_key=require_llm_api_key(model, purpose="llm_json"))
+    client = _openai_client(
+        api_key=require_llm_api_key(model, purpose="llm_json"),
+        idempotency_key=idempotency_key,
+    )
 
     if on_partial is None:
         kwargs = {
@@ -437,6 +595,9 @@ def llm_json(
         }
         if temperature is not None:
             kwargs["temperature"] = temperature
+        if max_completion_tokens is not None:
+            kwargs["max_completion_tokens"] = max_completion_tokens
+        kwargs.update(_openai_request_options(idempotency_key))
         resp = client.chat.completions.create(**kwargs)
         raw = resp.choices[0].message.content or "{}"
         usage = resp.usage
@@ -461,6 +622,9 @@ def llm_json(
     }
     if temperature is not None:
         kwargs["temperature"] = temperature
+    if max_completion_tokens is not None:
+        kwargs["max_completion_tokens"] = max_completion_tokens
+    kwargs.update(_openai_request_options(idempotency_key))
     stream = client.chat.completions.create(**kwargs)
     raw_parts: list[str] = []
     tokens_in = 0
@@ -483,21 +647,58 @@ def llm_json(
     return _parse_json_text(raw), tokens_in, tokens_out
 
 
-def llm_vision_json(*, system: str, user: str, image_urls: list[str], model: str = "qwen3.7-plus") -> tuple[dict, int, int]:
+def llm_vision_json(
+    *,
+    system: str,
+    user: str,
+    image_urls: list[str],
+    model: str = "qwen3.7-plus",
+    idempotency_key: str | None = None,
+    max_completion_tokens: int | None = None,
+) -> tuple[dict, int, int]:
     """VISION — let a vision model SEE image_urls and return JSON. Used so the agent reads the
     brand's UPLOADED images to understand the brand's own content. Caps at 8 images. Routes to
     Claude vision when `model` is a claude-* id (LOOP_STUDIO: Opus is the only brain — no gpt-4o
     analyst); otherwise OpenAI vision (detail='low' keeps cost down)."""
+    idempotency_key = _validated_idempotency_key(idempotency_key)
+    max_completion_tokens = _validated_max_completion_tokens(
+        max_completion_tokens
+    )
     urls = [u for u in (image_urls or []) if u][:8]
     if _is_claude_model(model):
-        return _anthropic_vision_json(system=system, user=user, image_urls=urls, model=model)
+        return _anthropic_vision_json(
+            system=system,
+            user=user,
+            image_urls=urls,
+            model=model,
+            idempotency_key=idempotency_key,
+            max_completion_tokens=max_completion_tokens,
+        )
+    if model.startswith("gemini"):
+        _reject_unsupported_provider_idempotency(
+            provider="gemini",
+            model=model,
+            idempotency_key=idempotency_key,
+        )
+        _reject_unsupported_provider_option(
+            provider="gemini",
+            model=model,
+            option="max_completion_tokens",
+            value=max_completion_tokens,
+        )
     # QWEN-VISION (founder 2026-07-03 "qwen vl이 opus보다 훨씬 잘한다 — 실험 끝"):
     # 도쿄 워크스페이스 OpenAI-호환으로 이미지 판독. 텍스트 qwen 분기와 동일 클라이언트 구성,
     # qwen3.7-plus=네이티브 멀티모달(비전 포함) — 정밀 grounding 필요 시 HIOB_VISION_MODEL로 교체.
     if model.startswith("qwen"):
+        _reject_unsupported_provider_idempotency(
+            provider="qwen",
+            model=model,
+            idempotency_key=idempotency_key,
+        )
         from hiob_core.model_providers import require_llm_api_key
-        qclient = OpenAI(
+        qclient = _openai_client(
             api_key=require_llm_api_key(model, purpose="llm_vision_json"),
+            idempotency_key=idempotency_key,
             base_url=os.environ.get(
                 "QWEN_OPENAI_BASE",
                 "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1",
@@ -506,12 +707,18 @@ def llm_vision_json(*, system: str, user: str, image_urls: list[str], model: str
         qcontent: list[dict] = [{"type": "text", "text": user}]
         for url in urls:
             qcontent.append({"type": "image_url", "image_url": {"url": url}})
-        qresp = qclient.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": qcontent}],
-            response_format={"type": "json_object"},
-            extra_body={"enable_thinking": False},
-        )
+        qkwargs = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": qcontent},
+            ],
+            "response_format": {"type": "json_object"},
+            "extra_body": {"enable_thinking": False},
+        }
+        if max_completion_tokens is not None:
+            qkwargs["max_tokens"] = max_completion_tokens
+        qresp = qclient.chat.completions.create(**qkwargs)
         qraw = qresp.choices[0].message.content or "{}"
         qusage = qresp.usage
         return (
@@ -520,23 +727,46 @@ def llm_vision_json(*, system: str, user: str, image_urls: list[str], model: str
             qusage.completion_tokens if qusage else 0,
         )
     from hiob_core.model_providers import require_llm_api_key
-    client = OpenAI(api_key=require_llm_api_key(model, purpose="llm_vision_json"))
+    client = _openai_client(
+        api_key=require_llm_api_key(model, purpose="llm_vision_json"),
+        idempotency_key=idempotency_key,
+    )
     content: list[dict] = [{"type": "text", "text": user}]
     for url in urls:
         content.append({"type": "image_url", "image_url": {"url": url, "detail": "low"}})
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": content}],
-        response_format={"type": "json_object"},
-    )
+    kwargs = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": content},
+        ],
+        "response_format": {"type": "json_object"},
+        **_openai_request_options(idempotency_key),
+    }
+    if max_completion_tokens is not None:
+        kwargs["max_completion_tokens"] = max_completion_tokens
+    resp = client.chat.completions.create(**kwargs)
     raw = resp.choices[0].message.content or "{}"
     usage = resp.usage
     return (_parse_json_text(raw), usage.prompt_tokens if usage else 0, usage.completion_tokens if usage else 0)
 
 
-def _anthropic_vision_json(*, system: str, user: str, image_urls: list[str], model: str) -> tuple[dict, int, int]:
+def _anthropic_vision_json(
+    *,
+    system: str,
+    user: str,
+    image_urls: list[str],
+    model: str,
+    idempotency_key: str | None = None,
+    max_completion_tokens: int | None = None,
+) -> tuple[dict, int, int]:
     """Claude VISION via URL image sources (the bucket is public-read). Lets Opus SEE the brand's
     real images and return JSON — so the brain itself reads the folder (LOOP_STUDIO APPLY#3)."""
+    _reject_unsupported_provider_idempotency(
+        provider="anthropic",
+        model=model,
+        idempotency_key=idempotency_key,
+    )
     try:
         from anthropic import Anthropic  # type: ignore
     except Exception as exc:  # pragma: no cover
@@ -552,7 +782,11 @@ def _anthropic_vision_json(*, system: str, user: str, image_urls: list[str], mod
     )
     resp = client.messages.create(
         model=model,
-        max_tokens=int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16000")),
+        max_tokens=(
+            max_completion_tokens
+            if max_completion_tokens is not None
+            else int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16000"))
+        ),
         system=f"{system}\n\nReturn only one valid JSON object. Do not wrap it in markdown.",
         messages=[{"role": "user", "content": content}],
     )
@@ -568,7 +802,12 @@ def _anthropic_vision_json(*, system: str, user: str, image_urls: list[str], mod
         parsed = _parse_json_text(raw)
     except json.JSONDecodeError:
         try:
-            parsed, repair_in, repair_out = _anthropic_repair_json_text(client, model=model, raw=raw)
+            parsed, repair_in, repair_out = _anthropic_repair_json_text(
+                client,
+                model=model,
+                raw=raw,
+                max_completion_tokens=max_completion_tokens,
+            )
         except JsonRepairError as exc:
             raise JsonRepairError(
                 str(exc),
@@ -580,7 +819,13 @@ def _anthropic_vision_json(*, system: str, user: str, image_urls: list[str], mod
     return (parsed, tokens_in, tokens_out)
 
 
-def _anthropic_cli_json(*, system: str, user: str, model: str) -> tuple[dict, int, int] | None:
+def _anthropic_cli_json(
+    *,
+    system: str,
+    user: str,
+    model: str,
+    max_completion_tokens: int | None = None,
+) -> tuple[dict, int, int] | None:
     """Attempt to call the local 'claude' CLI in print mode to use the user's
     Claude Pro/Max subscription session and avoid API billing.
 
@@ -590,6 +835,12 @@ def _anthropic_cli_json(*, system: str, user: str, model: str) -> tuple[dict, in
     """
     if os.environ.get("HIOB_LLM_CLI", "").strip().lower() not in {"1", "true", "yes"}:
         return None
+    _reject_unsupported_provider_option(
+        provider="anthropic-cli",
+        model=model,
+        option="max_completion_tokens",
+        value=max_completion_tokens,
+    )
     import subprocess
     import shutil
 
@@ -662,9 +913,27 @@ def _anthropic_cli_json(*, system: str, user: str, model: str) -> tuple[dict, in
         return None
 
 
-def _anthropic_json(*, system: str, user: str, model: str, temperature: float | None = None) -> tuple[dict, int, int]:
+def _anthropic_json(
+    *,
+    system: str,
+    user: str,
+    model: str,
+    temperature: float | None = None,
+    idempotency_key: str | None = None,
+    max_completion_tokens: int | None = None,
+) -> tuple[dict, int, int]:
+    _reject_unsupported_provider_idempotency(
+        provider="anthropic",
+        model=model,
+        idempotency_key=idempotency_key,
+    )
     # Try using local subscription-based Claude CLI first to avoid API billing
-    cli_res = _anthropic_cli_json(system=system, user=user, model=model)
+    cli_res = _anthropic_cli_json(
+        system=system,
+        user=user,
+        model=model,
+        max_completion_tokens=max_completion_tokens,
+    )
     if cli_res is not None:
         return cli_res
 
@@ -686,7 +955,11 @@ def _anthropic_json(*, system: str, user: str, model: str, temperature: float | 
     )
     kwargs = {
         "model": model,
-        "max_tokens": int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16000")),
+        "max_tokens": (
+            max_completion_tokens
+            if max_completion_tokens is not None
+            else int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16000"))
+        ),
         "system": (
             f"{system}\n\n"
             "Return only one valid JSON object. Do not wrap it in markdown."
@@ -708,7 +981,12 @@ def _anthropic_json(*, system: str, user: str, model: str, temperature: float | 
         parsed = _parse_json_text(raw)
     except json.JSONDecodeError:
         try:
-            parsed, repair_in, repair_out = _anthropic_repair_json_text(client, model=model, raw=raw)
+            parsed, repair_in, repair_out = _anthropic_repair_json_text(
+                client,
+                model=model,
+                raw=raw,
+                max_completion_tokens=max_completion_tokens,
+            )
         except JsonRepairError as exc:
             raise JsonRepairError(
                 str(exc),
