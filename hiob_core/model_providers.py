@@ -272,12 +272,27 @@ def engine_produces_video(engine_id: str) -> bool:
 # paid/network work; never put secret values in the raised message.
 
 
+class ProviderCredentialUnavailableError(RuntimeError):
+    """Provider credentials are deterministically unavailable before HTTP."""
+
+    provider_request_sent = False
+
+
+def normalize_llm_model_id(model: Any) -> str:
+    """Canonical provider model id used for routing, credentials, and HTTP."""
+
+    normalized = str(model or "").strip().lower()
+    if not normalized:
+        raise ValueError("model must be a non-empty string")
+    return normalized
+
+
 def env_names_for_llm_model(model: str) -> tuple[str, ...]:
     """Env var name(s) required for the llm_json / llm_vision_json route of `model`.
 
     First present non-empty wins (e.g. GEMINI_API_KEY or GOOGLE_API_KEY).
     """
-    m = str(model or "").strip().lower()
+    m = normalize_llm_model_id(model)
     if m.startswith("claude"):
         return ("ANTHROPIC_API_KEY",)
     if m.startswith("qwen"):
@@ -302,16 +317,17 @@ def require_llm_api_key(model: str, *, purpose: str = "script_candidates") -> st
     Does NOT include secret values in the exception. Empty string counts as missing
     (Modal secrets often ship KEY= which shadows and causes opaque 401s).
     """
-    names = env_names_for_llm_model(model)
+    normalized_model = normalize_llm_model_id(model)
+    names = env_names_for_llm_model(normalized_model)
     for name in names:
         val = (os.environ.get(name) or "").strip()
         if val:
             return val
     primary = names[0]
     alts = " / ".join(names)
-    raise RuntimeError(
+    raise ProviderCredentialUnavailableError(
         f"LLM_API_KEY_MISSING: {primary} is unset or empty "
-        f"(model={str(model or '')[:64] or '?'}, purpose={purpose}). "
+        f"(model={normalized_model[:64]}, purpose={purpose}). "
         f"Modal secret `hiob-env` must set {alts} (non-empty). "
         f"{primary} 미설정 또는 빈 값 — Modal 시크릿 hiob-env에 실제 키를 넣으세요. "
         f"(No API key value is printed.)"

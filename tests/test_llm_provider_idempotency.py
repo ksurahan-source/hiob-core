@@ -26,6 +26,7 @@ def _completion_response(payload: str = '{"ok": true}') -> SimpleNamespace:
 class _FakeOpenAI:
     clients: list[dict] = []
     requests: list[dict] = []
+    closed = 0
 
     def __init__(self, **kwargs):
         self.clients.append(kwargs)
@@ -37,6 +38,10 @@ class _FakeOpenAI:
     def reset(cls) -> None:
         cls.clients = []
         cls.requests = []
+        cls.closed = 0
+
+    def close(self) -> None:
+        type(self).closed += 1
 
     @classmethod
     def _create(cls, **kwargs):
@@ -70,6 +75,91 @@ def test_llm_json_passes_key_to_direct_openai_http_adapter(fake_openai):
         "X-Client-Request-Id": "ares-xl-writer:run-1:round-1"
     }
     assert fake_openai.requests[0]["max_completion_tokens"] == 32000
+
+
+def test_provider_preflight_constructs_and_closes_client_without_http(
+    fake_openai,
+):
+    assert llm_runtime.preflight_llm_request(
+        model="gpt-4o",
+        purpose="llm_json",
+        require_idempotency=True,
+        max_completion_tokens=32000,
+    ) is None
+    assert fake_openai.clients == [
+        {"api_key": "test-openai-key", "max_retries": 0}
+    ]
+    assert fake_openai.closed == 1
+    assert fake_openai.requests == []
+
+
+@pytest.mark.parametrize(
+    ("model", "provider"),
+    [
+        ("qwen3.7-max", "qwen"),
+        ("gemini-2.0-flash", "gemini"),
+        ("claude-sonnet-4-6", "anthropic"),
+    ],
+)
+def test_provider_preflight_rejects_unsupported_idempotency_before_credentials(
+    monkeypatch,
+    model,
+    provider,
+):
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    with pytest.raises(
+        llm_runtime.ProviderIdempotencyUnsupportedError,
+        match=f"{provider} model",
+    ) as exc_info:
+        llm_runtime.preflight_llm_request(
+            model=model,
+            purpose="llm_json",
+            require_idempotency=True,
+            max_completion_tokens=32000,
+        )
+
+    assert exc_info.value.provider_request_sent is False
+
+
+def test_provider_preflight_marks_missing_credentials_as_pre_send(monkeypatch):
+    from hiob_core.model_providers import ProviderCredentialUnavailableError
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(ProviderCredentialUnavailableError) as exc_info:
+        llm_runtime.preflight_llm_request(
+            model="gpt-4o",
+            purpose="llm_json",
+            require_idempotency=True,
+            max_completion_tokens=32000,
+        )
+
+    assert exc_info.value.provider_request_sent is False
+
+
+def test_provider_preflight_marks_invalid_proxy_config_as_pre_send(
+    monkeypatch,
+):
+    monkeypatch.setattr(llm_runtime, "OpenAI", RealOpenAI)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("HTTP_PROXY", "://bad")
+
+    with pytest.raises(
+        llm_runtime.ProviderClientConfigurationError,
+        match="client construction failed",
+    ) as exc_info:
+        llm_runtime.preflight_llm_request(
+            model="gpt-4o",
+            purpose="llm_json",
+            require_idempotency=True,
+            max_completion_tokens=32000,
+        )
+
+    assert exc_info.value.provider_request_sent is False
 
 
 def test_direct_openai_key_reaches_actual_http_header(monkeypatch):
@@ -288,6 +378,58 @@ def test_qwen_maps_completion_limit_to_provider_max_tokens(
     assert fake_openai.requests[0]["max_tokens"] == 12000
     assert "max_completion_tokens" not in fake_openai.requests[0]
     assert "max_retries" not in fake_openai.clients[0]
+
+
+def test_mixed_case_qwen_uses_one_normalized_route_for_preflight_and_call(
+    fake_openai,
+    monkeypatch,
+):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-qwen-key")
+    monkeypatch.delenv("QWEN_OPENAI_BASE", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "wrong-provider-key")
+
+    llm_runtime.preflight_llm_request(
+        model=" Qwen3.7-Max ",
+        purpose="llm_json",
+        max_completion_tokens=12000,
+    )
+    result, _, _ = llm_runtime.llm_json(
+        system="system",
+        user="user",
+        model=" Qwen3.7-Max ",
+        max_completion_tokens=12000,
+    )
+
+    assert result == {"ok": True}
+    assert fake_openai.clients == [
+        {
+            "api_key": "test-qwen-key",
+            "base_url": (
+                "https://ws-15myo7yelloeewav.ap-northeast-1.maas."
+                "aliyuncs.com/compatible-mode/v1"
+            ),
+        },
+        {
+            "api_key": "test-qwen-key",
+            "base_url": (
+                "https://ws-15myo7yelloeewav.ap-northeast-1.maas."
+                "aliyuncs.com/compatible-mode/v1"
+            ),
+        },
+    ]
+    assert fake_openai.closed == 1
+    assert fake_openai.requests == [
+        {
+            "model": "qwen3.7-max",
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "user"},
+            ],
+            "response_format": {"type": "json_object"},
+            "extra_body": {"enable_thinking": False},
+            "max_tokens": 12000,
+        }
+    ]
 
 
 def test_anthropic_maps_completion_limit_to_provider_max_tokens(

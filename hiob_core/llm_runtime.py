@@ -16,6 +16,8 @@ from typing import Any
 
 from openai import OpenAI
 
+from hiob_core.model_providers import normalize_llm_model_id
+
 # --------------------------------------------------------------------
 # Prompt loading — prompts live in git, not in DB.
 # --------------------------------------------------------------------
@@ -173,12 +175,22 @@ class JsonRepairError(ValueError):
         self.tokens_out = int(tokens_out or 0)
 
 
-class ProviderIdempotencyUnsupportedError(RuntimeError):
+class ProviderPreflightError(RuntimeError):
+    """A deterministic provider request failure detected before HTTP."""
+
+    provider_request_sent = False
+
+
+class ProviderIdempotencyUnsupportedError(ProviderPreflightError):
     """The selected provider cannot safely bind the caller's operation key."""
 
 
-class ProviderRequestOptionUnsupportedError(RuntimeError):
+class ProviderRequestOptionUnsupportedError(ProviderPreflightError):
     """The selected provider cannot safely honor a requested call option."""
+
+
+class ProviderClientConfigurationError(ProviderPreflightError):
+    """The provider SDK/client cannot be configured before any HTTP send."""
 
 
 def _validated_idempotency_key(idempotency_key: str | None) -> str | None:
@@ -246,6 +258,92 @@ def _reject_unsupported_provider_option(
     )
 
 
+def _provider_for_model(model: str) -> str:
+    """Return the provider route used by llm_json/llm_vision_json."""
+
+    normalized_model = normalize_llm_model_id(model)
+    if _is_claude_model(normalized_model):
+        return "anthropic"
+    if normalized_model.startswith("gemini"):
+        return "gemini"
+    if normalized_model.startswith("qwen"):
+        return "qwen"
+    return "openai"
+
+
+def _openai_base_url_for_provider(provider: str) -> str | None:
+    if provider == "gemini":
+        return "https://generativelanguage.googleapis.com/v1beta/openai/"
+    if provider == "qwen":
+        return os.environ.get(
+            "QWEN_OPENAI_BASE",
+            "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1",
+        )
+    return None
+
+
+def preflight_llm_request(
+    *,
+    model: str,
+    purpose: str,
+    require_idempotency: bool = False,
+    max_completion_tokens: int | None = None,
+) -> None:
+    """Validate one provider route through client construction without HTTP.
+
+    Callers that reserve paid work must invoke this before the reservation. The
+    runtime owns provider routing and capability knowledge; callers only state
+    the request options they require. SDK clients constructed here are closed
+    immediately; the paid call creates a fresh client bound to its real request
+    identity, avoiding cross-operation client reuse.
+    """
+
+    if purpose not in {"llm_json", "llm_vision_json"}:
+        raise ValueError(
+            "purpose must be 'llm_json' or 'llm_vision_json'"
+        )
+    normalized_model = normalize_llm_model_id(model)
+    if type(require_idempotency) is not bool:
+        raise TypeError("require_idempotency must be a bool")
+    max_completion_tokens = _validated_max_completion_tokens(
+        max_completion_tokens
+    )
+    provider = _provider_for_model(normalized_model)
+    if require_idempotency and provider != "openai":
+        _reject_unsupported_provider_idempotency(
+            provider=provider,
+            model=normalized_model,
+            idempotency_key="preflight-required",
+        )
+    if provider == "gemini":
+        _reject_unsupported_provider_option(
+            provider=provider,
+            model=normalized_model,
+            option="max_completion_tokens",
+            value=max_completion_tokens,
+        )
+    from hiob_core.model_providers import require_llm_api_key
+
+    api_key = require_llm_api_key(normalized_model, purpose=purpose)
+    if provider in {"openai", "gemini", "qwen"}:
+        client = _openai_client(
+            api_key=api_key,
+            idempotency_key=(
+                "preflight-required" if require_idempotency else None
+            ),
+            base_url=_openai_base_url_for_provider(provider),
+        )
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:
+                raise ProviderClientConfigurationError(
+                    "PROVIDER_CLIENT_CONFIGURATION_ERROR: "
+                    f"{provider} client cleanup failed before provider send"
+                ) from exc
+
+
 def _openai_client(
     *,
     api_key: str,
@@ -260,7 +358,13 @@ def _openai_client(
         # A reserved call must remain one HTTP attempt across every SDK-backed
         # adapter. Unknown outcomes return to the caller's reconcile boundary.
         kwargs["max_retries"] = 0
-    return OpenAI(**kwargs)
+    try:
+        return OpenAI(**kwargs)
+    except Exception as exc:
+        raise ProviderClientConfigurationError(
+            "PROVIDER_CLIENT_CONFIGURATION_ERROR: "
+            "OpenAI-compatible client construction failed before provider send"
+        ) from exc
 
 
 def _openai_request_options(idempotency_key: str | None) -> dict[str, Any]:
@@ -448,11 +552,13 @@ def llm_json(
     `max_completion_tokens` and Qwen/Anthropic `max_tokens`; undocumented
     compatibility mappings fail closed.
     """
+    model = normalize_llm_model_id(model)
+    provider = _provider_for_model(model)
     idempotency_key = _validated_idempotency_key(idempotency_key)
     max_completion_tokens = _validated_max_completion_tokens(
         max_completion_tokens
     )
-    if _is_claude_model(model):
+    if provider == "anthropic":
         return _anthropic_json(
             system=system,
             user=user,
@@ -464,7 +570,7 @@ def llm_json(
 
     # Gemini via its OpenAI-compatible endpoint (founder-provided key). Used by url_ingest
     # for cheap long-context extraction.
-    if model.startswith("gemini"):
+    if provider == "gemini":
         _reject_unsupported_provider_idempotency(
             provider="gemini",
             model=model,
@@ -480,7 +586,7 @@ def llm_json(
         gclient = _openai_client(
             api_key=require_llm_api_key(model, purpose="llm_json"),
             idempotency_key=idempotency_key,
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            base_url=_openai_base_url_for_provider(provider),
         )
         gkwargs = {
             "model": model,
@@ -502,7 +608,7 @@ def llm_json(
         )
 
     # Qwen via Tokyo workspace OpenAI-compatible endpoint
-    if model.startswith("qwen"):
+    if provider == "qwen":
         _reject_unsupported_provider_idempotency(
             provider="qwen",
             model=model,
@@ -514,10 +620,7 @@ def llm_json(
             # OpenAI-SDK 401 "No API-key provided." (dogfood job e25fb11d).
             api_key=require_llm_api_key(model, purpose="llm_json"),
             idempotency_key=idempotency_key,
-            base_url=os.environ.get(
-                "QWEN_OPENAI_BASE",
-                "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1"
-            ),
+            base_url=_openai_base_url_for_provider(provider),
         )
         qkwargs = {
             "model": model,
@@ -660,12 +763,14 @@ def llm_vision_json(
     brand's UPLOADED images to understand the brand's own content. Caps at 8 images. Routes to
     Claude vision when `model` is a claude-* id (LOOP_STUDIO: Opus is the only brain — no gpt-4o
     analyst); otherwise OpenAI vision (detail='low' keeps cost down)."""
+    model = normalize_llm_model_id(model)
+    provider = _provider_for_model(model)
     idempotency_key = _validated_idempotency_key(idempotency_key)
     max_completion_tokens = _validated_max_completion_tokens(
         max_completion_tokens
     )
     urls = [u for u in (image_urls or []) if u][:8]
-    if _is_claude_model(model):
+    if provider == "anthropic":
         return _anthropic_vision_json(
             system=system,
             user=user,
@@ -674,7 +779,7 @@ def llm_vision_json(
             idempotency_key=idempotency_key,
             max_completion_tokens=max_completion_tokens,
         )
-    if model.startswith("gemini"):
+    if provider == "gemini":
         _reject_unsupported_provider_idempotency(
             provider="gemini",
             model=model,
@@ -689,7 +794,7 @@ def llm_vision_json(
     # QWEN-VISION (founder 2026-07-03 "qwen vl이 opus보다 훨씬 잘한다 — 실험 끝"):
     # 도쿄 워크스페이스 OpenAI-호환으로 이미지 판독. 텍스트 qwen 분기와 동일 클라이언트 구성,
     # qwen3.7-plus=네이티브 멀티모달(비전 포함) — 정밀 grounding 필요 시 HIOB_VISION_MODEL로 교체.
-    if model.startswith("qwen"):
+    if provider == "qwen":
         _reject_unsupported_provider_idempotency(
             provider="qwen",
             model=model,
@@ -699,10 +804,7 @@ def llm_vision_json(
         qclient = _openai_client(
             api_key=require_llm_api_key(model, purpose="llm_vision_json"),
             idempotency_key=idempotency_key,
-            base_url=os.environ.get(
-                "QWEN_OPENAI_BASE",
-                "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1",
-            ),
+            base_url=_openai_base_url_for_provider(provider),
         )
         qcontent: list[dict] = [{"type": "text", "text": user}]
         for url in urls:
@@ -730,6 +832,7 @@ def llm_vision_json(
     client = _openai_client(
         api_key=require_llm_api_key(model, purpose="llm_vision_json"),
         idempotency_key=idempotency_key,
+        base_url=_openai_base_url_for_provider(provider),
     )
     content: list[dict] = [{"type": "text", "text": user}]
     for url in urls:
