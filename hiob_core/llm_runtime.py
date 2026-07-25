@@ -193,6 +193,16 @@ class ProviderClientConfigurationError(ProviderPreflightError):
     """The provider SDK/client cannot be configured before any HTTP send."""
 
 
+class ProviderRequestRejectedError(RuntimeError):
+    """OpenAI definitively rejected the request without accepting paid work."""
+
+    provider_request_sent = False
+
+    def __init__(self, message: str, *, status_code: int):
+        super().__init__(message)
+        self.status_code = int(status_code)
+
+
 def _validated_idempotency_key(idempotency_key: str | None) -> str | None:
     """Validate keys before they can become provider request metadata."""
     if idempotency_key is None:
@@ -377,6 +387,41 @@ def _openai_request_options(idempotency_key: str | None) -> dict[str, Any]:
     if idempotency_key is None:
         return {}
     return {"extra_headers": {"X-Client-Request-Id": idempotency_key}}
+
+
+_OPENAI_DEFINITIVE_REJECTION_STATUSES = frozenset({
+    400,
+    401,
+    403,
+    404,
+    422,
+})
+
+
+def _openai_chat_completion_create(
+    client: Any,
+    *,
+    provider: str,
+    idempotency_key: str | None,
+    kwargs: dict[str, Any],
+) -> Any:
+    """Classify definitive rejections only for a reserved OpenAI operation."""
+
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        status_code = getattr(exc, "status_code", None)
+        if (
+            provider == "openai"
+            and idempotency_key is not None
+            and status_code in _OPENAI_DEFINITIVE_REJECTION_STATUSES
+        ):
+            raise ProviderRequestRejectedError(
+                "PROVIDER_REQUEST_REJECTED: "
+                f"OpenAI rejected the request with HTTP {status_code}",
+                status_code=status_code,
+            ) from exc
+        raise
 
 
 def _parse_json_text(raw: str) -> dict:
@@ -701,7 +746,12 @@ def llm_json(
         if max_completion_tokens is not None:
             kwargs["max_completion_tokens"] = max_completion_tokens
         kwargs.update(_openai_request_options(idempotency_key))
-        resp = client.chat.completions.create(**kwargs)
+        resp = _openai_chat_completion_create(
+            client,
+            provider="openai",
+            idempotency_key=idempotency_key,
+            kwargs=kwargs,
+        )
         raw = resp.choices[0].message.content or "{}"
         usage = resp.usage
         return (
@@ -728,7 +778,12 @@ def llm_json(
     if max_completion_tokens is not None:
         kwargs["max_completion_tokens"] = max_completion_tokens
     kwargs.update(_openai_request_options(idempotency_key))
-    stream = client.chat.completions.create(**kwargs)
+    stream = _openai_chat_completion_create(
+        client,
+        provider="openai",
+        idempotency_key=idempotency_key,
+        kwargs=kwargs,
+    )
     raw_parts: list[str] = []
     tokens_in = 0
     tokens_out = 0
@@ -848,7 +903,12 @@ def llm_vision_json(
     }
     if max_completion_tokens is not None:
         kwargs["max_completion_tokens"] = max_completion_tokens
-    resp = client.chat.completions.create(**kwargs)
+    resp = _openai_chat_completion_create(
+        client,
+        provider=provider,
+        idempotency_key=idempotency_key,
+        kwargs=kwargs,
+    )
     raw = resp.choices[0].message.content or "{}"
     usage = resp.usage
     return (_parse_json_text(raw), usage.prompt_tokens if usage else 0, usage.completion_tokens if usage else 0)

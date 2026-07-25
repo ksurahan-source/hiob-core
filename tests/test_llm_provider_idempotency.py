@@ -57,6 +57,26 @@ def fake_openai(monkeypatch):
     return _FakeOpenAI
 
 
+def _install_real_openai_mock_transport(monkeypatch, responder):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return responder(request)
+
+    transport = httpx.MockTransport(handler)
+
+    def openai_factory(**kwargs):
+        return RealOpenAI(
+            **kwargs,
+            http_client=httpx.Client(transport=transport),
+        )
+
+    monkeypatch.setattr(llm_runtime, "OpenAI", openai_factory)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    return requests
+
+
 def test_llm_json_passes_key_to_direct_openai_http_adapter(fake_openai):
     result, tokens_in, tokens_out = llm_runtime.llm_json(
         system="system",
@@ -219,6 +239,152 @@ def test_direct_openai_key_reaches_actual_http_header(monkeypatch):
     )
     assert requests[0].read()
     assert json.loads(requests[0].content)["max_completion_tokens"] == 32000
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
+def test_definitive_openai_rejection_is_non_unknown(
+    monkeypatch,
+    status_code,
+):
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code,
+            request=request,
+            json={
+                "error": {
+                    "message": "definitive request rejection",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+
+    requests = _install_real_openai_mock_transport(
+        monkeypatch,
+        responder,
+    )
+
+    with pytest.raises(
+        llm_runtime.ProviderRequestRejectedError,
+        match=f"HTTP {status_code}",
+    ) as exc_info:
+        llm_runtime.llm_json(
+            system="system",
+            user="user",
+            model="gpt-4o",
+            idempotency_key=f"ares-xl-writer:status-{status_code}",
+            max_completion_tokens=32000,
+        )
+
+    assert exc_info.value.provider_request_sent is False
+    assert exc_info.value.status_code == status_code
+    assert getattr(exc_info.value.__cause__, "status_code", None) == status_code
+    assert len(requests) == 1
+
+
+def test_unreserved_openai_rejection_preserves_sdk_error(monkeypatch):
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            request=request,
+            json={
+                "error": {
+                    "message": "invalid request",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+
+    requests = _install_real_openai_mock_transport(
+        monkeypatch,
+        responder,
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        llm_runtime.llm_json(
+            system="system",
+            user="user",
+            model="gpt-4o",
+        )
+
+    assert not isinstance(
+        exc_info.value,
+        llm_runtime.ProviderRequestRejectedError,
+    )
+    assert getattr(exc_info.value, "status_code", None) == 400
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("failure", ["timeout", "connection", "500"])
+def test_ambiguous_openai_failure_remains_unknown(monkeypatch, failure):
+    def responder(request: httpx.Request) -> httpx.Response:
+        if failure == "timeout":
+            raise httpx.ReadTimeout("read timed out", request=request)
+        if failure == "connection":
+            raise httpx.ConnectError("connection lost", request=request)
+        return httpx.Response(
+            500,
+            request=request,
+            json={
+                "error": {
+                    "message": "provider internal error",
+                    "type": "server_error",
+                }
+            },
+        )
+
+    requests = _install_real_openai_mock_transport(
+        monkeypatch,
+        responder,
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        llm_runtime.llm_json(
+            system="system",
+            user="user",
+            model="gpt-4o",
+            idempotency_key=f"ares-xl-writer:{failure}",
+            max_completion_tokens=32000,
+        )
+
+    assert not isinstance(
+        exc_info.value,
+        llm_runtime.ProviderRequestRejectedError,
+    )
+    assert getattr(exc_info.value, "provider_request_sent", None) is not False
+    assert len(requests) == 1
+
+
+def test_definitive_openai_vision_rejection_is_non_unknown(monkeypatch):
+    def responder(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            request=request,
+            json={
+                "error": {
+                    "message": "invalid image request",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+
+    requests = _install_real_openai_mock_transport(
+        monkeypatch,
+        responder,
+    )
+
+    with pytest.raises(llm_runtime.ProviderRequestRejectedError) as exc_info:
+        llm_runtime.llm_vision_json(
+            system="system",
+            user="inspect",
+            image_urls=["https://example.test/proof.jpg"],
+            model="gpt-4o",
+            idempotency_key="ares-xl-writer:vision-422",
+            max_completion_tokens=24000,
+        )
+
+    assert exc_info.value.provider_request_sent is False
+    assert exc_info.value.status_code == 422
+    assert len(requests) == 1
 
 
 def test_llm_vision_json_passes_key_to_direct_openai_http_adapter(fake_openai):
