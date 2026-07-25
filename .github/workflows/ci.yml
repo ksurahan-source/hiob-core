@@ -1,5 +1,14 @@
 name: ci
-on: [push, pull_request]
+
+# Avoid double runs on open PRs (push + pull_request):
+# - feature branches: pull_request only
+# - main: push only
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
 jobs:
   test:
     runs-on: ubuntu-latest

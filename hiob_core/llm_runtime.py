@@ -20,20 +20,36 @@ from openai import OpenAI
 # Prompt loading — prompts live in git, not in DB.
 # --------------------------------------------------------------------
 
+def _is_usable_dir(path: Path) -> bool:
+    """True if path is a directory. Permission denied / I/O errors → False.
+
+    GitHub Actions Ubuntu runners raise PermissionError on ``Path('/root/…').is_dir()``
+    (not a soft False). Import-time probe must never kill the process.
+    """
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
 def _resolve_prompt_dir() -> Path:
     """Locate the prompts dir across environments (this package is imported from many roots):
-    HIOB_PROMPT_DIR override → Modal image /root/prompts → walk up to apps/modal/prompts (local)."""
+    HIOB_PROMPT_DIR override → Modal image /root/prompts → walk up to apps/modal/prompts (local).
+
+    Never raises on unreadable paths (GitHub hosted runners cannot stat /root).
+    """
     env = os.environ.get("HIOB_PROMPT_DIR")
-    if env and Path(env).is_dir():
+    if env and _is_usable_dir(Path(env)):
         return Path(env)
     root_prompts = Path("/root/prompts")  # Modal image: prompts copied here at build
-    if root_prompts.is_dir():
+    if _is_usable_dir(root_prompts):
         return root_prompts
     for parent in Path(__file__).resolve().parents:  # local/dev: find the repo's apps/modal/prompts
         cand = parent / "apps" / "modal" / "prompts"
-        if cand.is_dir():
+        if _is_usable_dir(cand):
             return cand
-    return root_prompts  # default (load_prompt fails soft to "" if absent)
+    # Default path may not exist or may be unreadable; load_prompt fails soft.
+    return root_prompts
 
 
 _PROMPT_DIR = _resolve_prompt_dir()
@@ -48,7 +64,8 @@ def load_prompt(name: str) -> str:
     path = _PROMPT_DIR / f"{name}.txt"
     try:
         text = path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
+    except OSError:
+        # FileNotFoundError, PermissionError, etc. — fail soft
         text = ""
     _PROMPT_CACHE[name] = text
     return text
