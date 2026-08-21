@@ -471,6 +471,25 @@ def _qwen_json(
         )
 
 
+def _stream_chunk_content(chunk: Any) -> str | None:
+    if not chunk.choices or not chunk.choices[0].delta:
+        return None
+    return chunk.choices[0].delta.content
+
+
+def _emit_stream_partial(
+    on_partial: Callable[[str], None], raw_parts: list[str], last_emit: float
+) -> float:
+    now = time.monotonic()
+    if now - last_emit < 0.6:
+        return last_emit
+    try:
+        on_partial("".join(raw_parts)[-2000:])
+    except Exception:
+        pass
+    return now
+
+
 def _openai_stream_json(
     client: OpenAI,
     *,
@@ -492,20 +511,10 @@ def _openai_stream_json(
     tokens_out = 0
     last_emit = 0.0
     for chunk in stream:
-        content = (
-            chunk.choices[0].delta.content
-            if chunk.choices and chunk.choices[0].delta
-            else None
-        )
+        content = _stream_chunk_content(chunk)
         if content:
             raw_parts.append(content)
-            now = time.monotonic()
-            if now - last_emit >= 0.6:
-                last_emit = now
-                try:
-                    on_partial("".join(raw_parts)[-2000:])
-                except Exception:
-                    pass
+            last_emit = _emit_stream_partial(on_partial, raw_parts, last_emit)
         if getattr(chunk, "usage", None):
             tokens_in, tokens_out = _usage_tokens(chunk.usage)
     return (
