@@ -12,9 +12,16 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from openai import OpenAI
+
+_QWEN_PLUS_MODEL = "qwen3.7-plus"
+_QWEN_OPENAI_BASE = (
+    "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/"
+    "compatible-mode/v1"
+)
+_GEMINI_OPENAI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 # --------------------------------------------------------------------
 # Prompt loading — prompts live in git, not in DB.
@@ -103,7 +110,7 @@ def load_localized_prompt(name: str, locale: str | None) -> str:
 # Claude/GPT 복귀는 env 오버라이드만 (코드 기본은 Qwen 단일).
 TIER_ENV = {
     "cheap":   ("HIOB_CHEAP_MODEL",   "qwen3.6-flash"),
-    "default": ("HIOB_DEFAULT_MODEL", "qwen3.7-plus"),
+    "default": ("HIOB_DEFAULT_MODEL", _QWEN_PLUS_MODEL),
     "premium": ("HIOB_PREMIUM_MODEL", "qwen3.7-max"),
 }
 
@@ -118,13 +125,16 @@ def resolve_model(role_row: dict | None) -> tuple[str, str]:
       4. fallback to HIOB_DEFAULT_MODEL (Sonnet 4.6)
     """
     if not role_row:
-        return os.environ.get("HIOB_DEFAULT_MODEL", "qwen3.7-plus"), "default"
+        return os.environ.get("HIOB_DEFAULT_MODEL", _QWEN_PLUS_MODEL), "default"
 
     attrs = role_row.get("attributes") or {}
     if isinstance(attrs, dict) and attrs.get("model_override"):
         return str(attrs["model_override"]), "override"
 
-    tier = (role_row.get("model_tier") or "default").lower()
+    tier_value = role_row.get("model_tier")
+    if not tier_value and role_row.get("default_model"):
+        return str(role_row["default_model"]), "legacy"
+    tier = (tier_value or "default").lower()
     env_key, default_model = TIER_ENV.get(tier, TIER_ENV["default"])
     return os.environ.get(env_key, default_model), tier
 
@@ -216,6 +226,10 @@ def _require_json_object(value: Any, *, source: str) -> dict:
     return value
 
 
+def _parse_json_object(raw: str, *, source: str) -> dict:
+    return _require_json_object(_parse_json_text(raw), source=source)
+
+
 def _anthropic_repair_json_text(client: Any, *, model: str, raw: str) -> tuple[dict, int, int]:
     """Repair a malformed Claude JSON response once.
 
@@ -249,7 +263,7 @@ def _anthropic_repair_json_text(client: Any, *, model: str, raw: str) -> tuple[d
     repair_out = int(getattr(usage, "output_tokens", 0) or 0)
     repaired_raw = "".join(repaired_parts)
     try:
-        parsed = _require_json_object(_parse_json_text(repaired_raw), source="Claude JSON repair")
+        parsed = _parse_json_object(repaired_raw, source="Claude JSON repair")
     except (json.JSONDecodeError, ValueError) as exc:
         raise JsonRepairError(
             "Claude JSON repair failed to return a valid JSON object",
@@ -326,12 +340,214 @@ def langfuse_log(
 # LLM call (sync) — used by the role runner.
 # --------------------------------------------------------------------
 
+def _chat_messages(system: str, user: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _chat_kwargs(
+    *,
+    system: str,
+    user: str,
+    model: str,
+    temperature: float | None,
+    extra_body: dict[str, Any] | None = None,
+    stream: bool = False,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": _chat_messages(system, user),
+        "response_format": {"type": "json_object"},
+    }
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if extra_body is not None:
+        kwargs["extra_body"] = extra_body
+    if stream:
+        kwargs["stream"] = True
+        kwargs["stream_options"] = {"include_usage": True}
+    return kwargs
+
+
+def _usage_tokens(usage: Any) -> tuple[int, int]:
+    return (
+        int(getattr(usage, "prompt_tokens", 0) or 0),
+        int(getattr(usage, "completion_tokens", 0) or 0),
+    )
+
+
+def _completion_result(response: Any) -> tuple[dict, int, int]:
+    raw = response.choices[0].message.content or "{}"
+    tokens_in, tokens_out = _usage_tokens(getattr(response, "usage", None))
+    return _parse_json_object(raw, source="OpenAI completion"), tokens_in, tokens_out
+
+
+def _provider_client(model: str, *, purpose: str, base_url: str | None = None) -> OpenAI:
+    from hiob_core.model_providers import require_llm_api_key
+
+    kwargs: dict[str, Any] = {"api_key": require_llm_api_key(model, purpose=purpose)}
+    if base_url is not None:
+        kwargs["base_url"] = base_url
+    return OpenAI(**kwargs)
+
+
+def _gemini_json(
+    *, system: str, user: str, model: str, temperature: float | None
+) -> tuple[dict, int, int]:
+    client = _provider_client(model, purpose="llm_json", base_url=_GEMINI_OPENAI_BASE)
+    response = client.chat.completions.create(**_chat_kwargs(
+        system=system,
+        user=user,
+        model=model,
+        temperature=temperature,
+    ))
+    return _completion_result(response)
+
+
+def _qwen_repair_result(
+    client: OpenAI,
+    *,
+    model: str,
+    raw: str,
+    tokens_in: int,
+    tokens_out: int,
+) -> tuple[dict, int, int]:
+    response = client.chat.completions.create(
+        **_chat_kwargs(
+            system=(
+                "You repair malformed JSON. Return only one syntactically valid JSON object. "
+                "Do not add markdown, explanation, comments, or fields not implied by the input."
+            ),
+            user=(
+                "Repair this malformed JSON object so json.loads can parse it. "
+                "Preserve Korean text and field names exactly where possible.\n\n" + raw
+            ),
+            model=model,
+            temperature=0,
+            extra_body={"enable_thinking": False},
+        )
+    )
+    repaired_raw = response.choices[0].message.content or "{}"
+    repair_in, repair_out = _usage_tokens(getattr(response, "usage", None))
+    try:
+        parsed = _parse_json_object(repaired_raw, source="Qwen JSON repair")
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise JsonRepairError(
+            "Qwen JSON repair failed to return a valid JSON object",
+            tokens_in=tokens_in + repair_in,
+            tokens_out=tokens_out + repair_out,
+        ) from exc
+    return parsed, tokens_in + repair_in, tokens_out + repair_out
+
+
+def _qwen_json(
+    *, system: str, user: str, model: str, temperature: float | None
+) -> tuple[dict, int, int]:
+    client = _provider_client(
+        model,
+        purpose="llm_json",
+        base_url=os.environ.get("QWEN_OPENAI_BASE", _QWEN_OPENAI_BASE),
+    )
+    response = client.chat.completions.create(**_chat_kwargs(
+        system=system,
+        user=user,
+        model=model,
+        temperature=temperature,
+        extra_body={"enable_thinking": False},
+    ))
+    raw = response.choices[0].message.content or "{}"
+    tokens_in, tokens_out = _usage_tokens(getattr(response, "usage", None))
+    try:
+        return _parse_json_object(raw, source="Qwen completion"), tokens_in, tokens_out
+    except json.JSONDecodeError:
+        return _qwen_repair_result(
+            client,
+            model=model,
+            raw=raw,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+        )
+
+
+def _openai_stream_json(
+    client: OpenAI,
+    *,
+    system: str,
+    user: str,
+    model: str,
+    on_partial: Callable[[str], None],
+    temperature: float | None,
+) -> tuple[dict, int, int]:
+    stream = client.chat.completions.create(**_chat_kwargs(
+        system=system,
+        user=user,
+        model=model,
+        temperature=temperature,
+        stream=True,
+    ))
+    raw_parts: list[str] = []
+    tokens_in = 0
+    tokens_out = 0
+    last_emit = 0.0
+    for chunk in stream:
+        content = (
+            chunk.choices[0].delta.content
+            if chunk.choices and chunk.choices[0].delta
+            else None
+        )
+        if content:
+            raw_parts.append(content)
+            now = time.monotonic()
+            if now - last_emit >= 0.6:
+                last_emit = now
+                try:
+                    on_partial("".join(raw_parts)[-2000:])
+                except Exception:
+                    pass
+        if getattr(chunk, "usage", None):
+            tokens_in, tokens_out = _usage_tokens(chunk.usage)
+    return (
+        _parse_json_object("".join(raw_parts) or "{}", source="OpenAI stream"),
+        tokens_in,
+        tokens_out,
+    )
+
+
+def _openai_json(
+    *,
+    system: str,
+    user: str,
+    model: str,
+    on_partial: Callable[[str], None] | None,
+    temperature: float | None,
+) -> tuple[dict, int, int]:
+    client = _provider_client(model, purpose="llm_json")
+    if on_partial is not None:
+        return _openai_stream_json(
+            client,
+            system=system,
+            user=user,
+            model=model,
+            on_partial=on_partial,
+            temperature=temperature,
+        )
+    response = client.chat.completions.create(**_chat_kwargs(
+        system=system,
+        user=user,
+        model=model,
+        temperature=temperature,
+    ))
+    return _completion_result(response)
+
+
 def llm_json(
     *,
     system: str,
     user: str,
     model: str,
-    on_partial: callable | None = None,
+    on_partial: Callable[[str], None] | None = None,
     temperature: float | None = None,
 ) -> tuple[dict, int, int]:
     """Call OpenAI, Anthropic, Gemini, or Qwen; return (parsed_json, tokens_in, tokens_out).
@@ -345,162 +561,24 @@ def llm_json(
     """
     if _is_claude_model(model):
         return _anthropic_json(system=system, user=user, model=model, temperature=temperature)
-
-    # Gemini via its OpenAI-compatible endpoint (founder-provided key). Used by url_ingest
-    # for cheap long-context extraction.
     if model.startswith("gemini"):
-        from hiob_core.model_providers import require_llm_api_key
-        gclient = OpenAI(
-            api_key=require_llm_api_key(model, purpose="llm_json"),
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        return _gemini_json(
+            system=system, user=user, model=model, temperature=temperature
         )
-        gkwargs = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "response_format": {"type": "json_object"},
-        }
-        if temperature is not None:
-            gkwargs["temperature"] = temperature
-        gresp = gclient.chat.completions.create(**gkwargs)
-        graw = gresp.choices[0].message.content or "{}"
-        gusage = gresp.usage
-        return (
-            _parse_json_text(graw),
-            gusage.prompt_tokens if gusage else 0,
-            gusage.completion_tokens if gusage else 0,
-        )
-
-    # Qwen via Tokyo workspace OpenAI-compatible endpoint
     if model.startswith("qwen"):
-        from hiob_core.model_providers import require_llm_api_key
-        qwen_client = OpenAI(
-            # Fail-loud on empty DASHSCOPE_API_KEY — empty string produced opaque
-            # OpenAI-SDK 401 "No API-key provided." (dogfood job e25fb11d).
-            api_key=require_llm_api_key(model, purpose="llm_json"),
-            base_url=os.environ.get(
-                "QWEN_OPENAI_BASE",
-                "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1"
-            ),
+        return _qwen_json(
+            system=system, user=user, model=model, temperature=temperature
         )
-        qkwargs = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "response_format": {"type": "json_object"},
-            # qwen3.7 계열은 사고형(reasoning) 기본 ON — JSON 산출에는 불필요한 토큰이라 끈다.
-            # (도쿄 compatible-mode 실측 2026-07-02: enable_thinking:false + json_object 조합 정상)
-            "extra_body": {"enable_thinking": False},
-        }
-        if temperature is not None:
-            qkwargs["temperature"] = temperature
-        qresp = qwen_client.chat.completions.create(**qkwargs)
-        qraw = qresp.choices[0].message.content or "{}"
-        qusage = qresp.usage
-        q_in = qusage.prompt_tokens if qusage else 0
-        q_out = qusage.completion_tokens if qusage else 0
-        try:
-            return (_parse_json_text(qraw), q_in, q_out)
-        except json.JSONDecodeError:
-            # D-46 이후 유일한 프로덕션 경로가 qwen인데 repair는 Claude 전용이었다(2026-07-03 감사).
-            # 동일 엔드포인트 1회 결정론 수리 — 실패 시 원 예외 대신 JsonRepairError로 승격.
-            rkwargs = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": (
-                        "You repair malformed JSON. Return only one syntactically valid JSON object. "
-                        "Do not add markdown, explanation, comments, or fields not implied by the input."
-                    )},
-                    {"role": "user", "content": (
-                        "Repair this malformed JSON object so json.loads can parse it. "
-                        "Preserve Korean text and field names exactly where possible.\n\n" + (qraw or "")
-                    )},
-                ],
-                "response_format": {"type": "json_object"},
-                "temperature": 0,
-                "extra_body": {"enable_thinking": False},
-            }
-            rresp = qwen_client.chat.completions.create(**rkwargs)
-            rraw = rresp.choices[0].message.content or "{}"
-            rusage = rresp.usage
-            r_in = rusage.prompt_tokens if rusage else 0
-            r_out = rusage.completion_tokens if rusage else 0
-            try:
-                parsed = _require_json_object(_parse_json_text(rraw), source="Qwen JSON repair")
-            except (json.JSONDecodeError, ValueError) as exc:
-                raise JsonRepairError(
-                    "Qwen JSON repair failed to return a valid JSON object",
-                    tokens_in=q_in + r_in,
-                    tokens_out=q_out + r_out,
-                ) from exc
-            return (parsed, q_in + r_in, q_out + r_out)
-
-    # Default: OpenAI (includes GPT and other OpenAI models)
-    from hiob_core.model_providers import require_llm_api_key
-    client = OpenAI(api_key=require_llm_api_key(model, purpose="llm_json"))
-
-    if on_partial is None:
-        kwargs = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "response_format": {"type": "json_object"},
-        }
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-        resp = client.chat.completions.create(**kwargs)
-        raw = resp.choices[0].message.content or "{}"
-        usage = resp.usage
-        return (
-            _parse_json_text(raw),
-            usage.prompt_tokens if usage else 0,
-            usage.completion_tokens if usage else 0,
-        )
-
-    # Streaming path — emit periodic partials so the editor reflects
-    # progress. We still parse JSON at the end; partial JSON inside a
-    # `json_object` response is not always valid mid-stream.
-    kwargs = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "response_format": {"type": "json_object"},
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    }
-    if temperature is not None:
-        kwargs["temperature"] = temperature
-    stream = client.chat.completions.create(**kwargs)
-    raw_parts: list[str] = []
-    tokens_in = 0
-    tokens_out = 0
-    last_emit = 0.0
-    for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-            raw_parts.append(chunk.choices[0].delta.content)
-            now = time.monotonic()
-            if now - last_emit >= 0.6:
-                last_emit = now
-                try:
-                    on_partial("".join(raw_parts)[-2000:])
-                except Exception:
-                    pass
-        if getattr(chunk, "usage", None):
-            tokens_in = chunk.usage.prompt_tokens or 0
-            tokens_out = chunk.usage.completion_tokens or 0
-    raw = "".join(raw_parts) or "{}"
-    return _parse_json_text(raw), tokens_in, tokens_out
+    return _openai_json(
+        system=system,
+        user=user,
+        model=model,
+        on_partial=on_partial,
+        temperature=temperature,
+    )
 
 
-def llm_vision_json(*, system: str, user: str, image_urls: list[str], model: str = "qwen3.7-plus") -> tuple[dict, int, int]:
+def llm_vision_json(*, system: str, user: str, image_urls: list[str], model: str = _QWEN_PLUS_MODEL) -> tuple[dict, int, int]:
     """VISION — let a vision model SEE image_urls and return JSON. Used so the agent reads the
     brand's UPLOADED images to understand the brand's own content. Caps at 8 images. Routes to
     Claude vision when `model` is a claude-* id (LOOP_STUDIO: Opus is the only brain — no gpt-4o
@@ -517,7 +595,7 @@ def llm_vision_json(*, system: str, user: str, image_urls: list[str], model: str
             api_key=require_llm_api_key(model, purpose="llm_vision_json"),
             base_url=os.environ.get(
                 "QWEN_OPENAI_BASE",
-                "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1",
+                _QWEN_OPENAI_BASE,
             ),
         )
         qcontent: list[dict] = [{"type": "text", "text": user}]
@@ -532,7 +610,7 @@ def llm_vision_json(*, system: str, user: str, image_urls: list[str], model: str
         qraw = qresp.choices[0].message.content or "{}"
         qusage = qresp.usage
         return (
-            _parse_json_text(qraw),
+            _parse_json_object(qraw, source="Qwen vision"),
             qusage.prompt_tokens if qusage else 0,
             qusage.completion_tokens if qusage else 0,
         )
@@ -548,7 +626,11 @@ def llm_vision_json(*, system: str, user: str, image_urls: list[str], model: str
     )
     raw = resp.choices[0].message.content or "{}"
     usage = resp.usage
-    return (_parse_json_text(raw), usage.prompt_tokens if usage else 0, usage.completion_tokens if usage else 0)
+    return (
+        _parse_json_object(raw, source="OpenAI vision"),
+        usage.prompt_tokens if usage else 0,
+        usage.completion_tokens if usage else 0,
+    )
 
 
 def _anthropic_vision_json(*, system: str, user: str, image_urls: list[str], model: str) -> tuple[dict, int, int]:
@@ -582,7 +664,7 @@ def _anthropic_vision_json(*, system: str, user: str, image_urls: list[str], mod
     tokens_in = int(getattr(usage, "input_tokens", 0) or 0)
     tokens_out = int(getattr(usage, "output_tokens", 0) or 0)
     try:
-        parsed = _parse_json_text(raw)
+        parsed = _parse_json_object(raw, source="Claude vision")
     except json.JSONDecodeError:
         try:
             parsed, repair_in, repair_out = _anthropic_repair_json_text(client, model=model, raw=raw)
@@ -597,59 +679,60 @@ def _anthropic_vision_json(*, system: str, user: str, image_urls: list[str], mod
     return (parsed, tokens_in, tokens_out)
 
 
-def _anthropic_cli_json(*, system: str, user: str, model: str) -> tuple[dict, int, int] | None:
-    """Attempt to call the local 'claude' CLI in print mode to use the user's
-    Claude Pro/Max subscription session and avoid API billing.
-
-    OPT-IN ONLY (HIOB_LLM_CLI=1, local dev): a Modal container has no
-    subscription session, and probing `npx @anthropic-ai/claude-code` there
-    would add up to 120s dead latency per LLM call before the API fallback.
-    """
-    if os.environ.get("HIOB_LLM_CLI", "").strip().lower() not in {"1", "true", "yes"}:
-        return None
-    import subprocess
+def _claude_cli_command() -> list[str] | None:
     import shutil
 
-    # Check if 'claude' or 'npx' is available locally
     claude_path = shutil.which("claude")
+    if claude_path:
+        return [claude_path]
     npx_path = shutil.which("npx")
+    return [npx_path, "@anthropic-ai/claude-code"] if npx_path else None
 
-    if not claude_path and not npx_path:
-        return None
 
-    cmd = [claude_path or "claude"]
-    if not claude_path:
-        cmd = ["npx", "@anthropic-ai/claude-code"]
+def _claude_cli_model(model: str) -> str:
+    lowered = model.lower()
+    for family in ("opus", "sonnet", "haiku"):
+        if family in lowered:
+            return family
+    return model
 
-    model_arg = model
-    if "opus" in model.lower():
-        model_arg = "opus"
-    elif "sonnet" in model.lower():
-        model_arg = "sonnet"
-    elif "haiku" in model.lower():
-        model_arg = "haiku"
+
+def _strip_json_fence(raw_output: str) -> str:
+    cleaned = raw_output.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    return cleaned.strip()
+
+
+def _run_claude_cli(
+    command: list[str], *, system: str, user: str, model: str
+) -> tuple[dict, int, int] | None:
+    import subprocess
 
     full_prompt = (
         f"System Prompt:\n{system}\n\n"
         f"User Prompt:\n{user}\n\n"
-        "Return ONLY a single valid raw JSON object. Do not wrap it in markdown. No explanation."
+        "Return ONLY a single valid raw JSON object. Do not wrap it in markdown. "
+        "No explanation."
     )
-
     run_cmd = [
-        cmd[0],
-        *cmd[1:],
+        *command,
         "--print",
         full_prompt,
-        "--tools", "",
-        "--permission-mode", "dontAsk",
-        "--model", model_arg
+        "--tools",
+        "",
+        "--permission-mode",
+        "dontAsk",
+        "--model",
+        _claude_cli_model(model),
     ]
-
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)
     try:
-        env = os.environ.copy()
-        if "ANTHROPIC_API_KEY" in env:
-            del env["ANTHROPIC_API_KEY"]
-
         result = subprocess.run(
             run_cmd,
             capture_output=True,
@@ -657,26 +740,27 @@ def _anthropic_cli_json(*, system: str, user: str, model: str) -> tuple[dict, in
             env=env,
             timeout=120,
         )
-
-        if result.returncode == 0:
-            raw_output = result.stdout.strip()
-            # Clean up markdown JSON wrapper if present
-            if raw_output.startswith("```json"):
-                raw_output = raw_output[7:]
-            elif raw_output.startswith("```"):
-                raw_output = raw_output[3:]
-            if raw_output.endswith("```"):
-                raw_output = raw_output[:-3]
-            raw_output = raw_output.strip()
-
-            parsed = _parse_json_text(raw_output)
-            tokens_in = len(system + user) // 4
-            tokens_out = len(raw_output) // 4
-            return parsed, tokens_in, tokens_out
-        else:
+        if result.returncode != 0:
             return None
+        raw_output = _strip_json_fence(result.stdout)
+        return (
+            _parse_json_object(raw_output, source="Claude CLI"),
+            len(system + user) // 4,
+            len(raw_output) // 4,
+        )
     except Exception:
         return None
+
+
+def _anthropic_cli_json(*, system: str, user: str, model: str) -> tuple[dict, int, int] | None:
+    """Use a local Claude subscription only when explicitly enabled."""
+    enabled = os.environ.get("HIOB_LLM_CLI", "").strip().lower()
+    if enabled not in {"1", "true", "yes"}:
+        return None
+    command = _claude_cli_command()
+    if command is None:
+        return None
+    return _run_claude_cli(command, system=system, user=user, model=model)
 
 
 def _anthropic_json(*, system: str, user: str, model: str, temperature: float | None = None) -> tuple[dict, int, int]:
@@ -722,7 +806,7 @@ def _anthropic_json(*, system: str, user: str, model: str, temperature: float | 
     tokens_in = int(getattr(usage, "input_tokens", 0) or 0)
     tokens_out = int(getattr(usage, "output_tokens", 0) or 0)
     try:
-        parsed = _parse_json_text(raw)
+        parsed = _parse_json_object(raw, source="Claude completion")
     except json.JSONDecodeError:
         try:
             parsed, repair_in, repair_out = _anthropic_repair_json_text(client, model=model, raw=raw)
@@ -757,12 +841,12 @@ def llm_json_cached(
     Fail-open: any cache error falls through to a direct LLM call.
     Logs [cache] HIT/MISS for observability.
     """
-    from infra import redis_client  # lazy — avoids circular import at module load
-
     raw_key = f"{model}:{system}:{user}"
     cache_key = "llm:" + hashlib.sha256(raw_key.encode()).hexdigest()
 
     try:
+        from infra import redis_client  # lazy — avoids circular import at module load
+
         cached_str = redis_client.cache_get(cache_key)
         if cached_str is not None:
             hit = json.loads(cached_str)

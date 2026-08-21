@@ -47,10 +47,6 @@ def normalize_engine(engine: str | None) -> str:
     # try aliases
     if e in _ENGINE_ALIASES:
         return _ENGINE_ALIASES[e]
-    # restore hyphens for qwen ids
-    hy = str(engine or "").strip()
-    if hy in COST_TABLE:
-        return hy
     return raw or "openai_image"
 
 
@@ -85,9 +81,6 @@ def _env_override(engine: str, resolution: str) -> float | None:
 def unit_cost_cents(engine: str, resolution: str | None = None) -> float:
     """Return unit cost (cents/sec for video, cents/image for image)."""
     eng = normalize_engine(engine)
-    image = eng in _IMAGE_ENGINES or eng not in {
-        "seedance_fast", "seedance_hi", "kling", "hailuo", "veo",
-    } and eng in COST_TABLE and "720p" not in COST_TABLE.get(eng, {})
     # classify by table shape
     table = COST_TABLE.get(eng) or COST_TABLE["openai_image"]
     is_image = "720p" not in table
