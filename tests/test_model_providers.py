@@ -173,6 +173,20 @@ class TestLlmApiKeyFailLoud:
             require_script_llm_credentials({})
         assert "DASHSCOPE_API_KEY" in str(ei.value)
 
+    def test_key_presence_and_script_credential_success(self, monkeypatch):
+        from hiob_core.model_providers import (
+            llm_api_key_present,
+            require_script_llm_credentials,
+        )
+
+        monkeypatch.setenv("GEMINI_API_KEY", "")
+        monkeypatch.setenv("GOOGLE_API_KEY", "google-test")
+        assert llm_api_key_present("gemini-test") is True
+        monkeypatch.delenv("GOOGLE_API_KEY")
+        assert llm_api_key_present("gemini-test") is False
+        monkeypatch.setenv("DASHSCOPE_API_KEY", "qwen-test")
+        assert require_script_llm_credentials({}) == "qwen3.7-max"
+
 
 class TestDataStructures:
     """Verify registries are well-formed."""

@@ -28,6 +28,9 @@ from __future__ import annotations
 import os
 from typing import Any
 
+_QWEN_MAX_MODEL = "qwen3.7-max"
+_QWEN_PLUS_MODEL = "qwen3.7-plus"
+
 # ── SCRIPT models (the 기획서 LLM) ───────────────────────────────────────────
 # SSOT: call resolve_script_model() / script_model_id() — never fork model choice
 # via ad-hoc os.environ.get("CLAUDE_SCRIPT_MODEL") at call sites (LP7-7).
@@ -53,7 +56,7 @@ SCRIPT_MODELS: dict[str, dict[str, Any]] = {
         # 도쿄 워크스페이스 실존 모델(콘솔 실측 2026-07-02): qwen3.7-max/plus·qwen3.6-plus/flash.
         # qwen3-max는 이 리전에 없음 — 기본은 최상급 qwen3.7-max, env로 오버라이드.
         "id": "qwen", "label": "Qwen (3.7-max · Tokyo)", "provider": "qwen",
-        "model": _env_model("HIOB_QWEN_SCRIPT_MODEL", "qwen3.7-max"),
+        "model": _env_model("HIOB_QWEN_SCRIPT_MODEL", _QWEN_MAX_MODEL),
         "env": "DASHSCOPE_API_KEY", "status": "live",
         "base_url_env": "QWEN_OPENAI_BASE", "base_url_default": "https://ws-15myo7yelloeewav.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1",
     },
@@ -66,7 +69,8 @@ DEFAULT_SCRIPT_MODEL = "qwen"
 _SCRIPT_ALIASES = {
     "claude-opus-4-8": "claude", "opus": "claude", "anthropic": "claude",
     "gpt-4o": "gpt", "gpt4o": "gpt", "openai": "gpt", "chatgpt": "gpt",
-    "qwen": "qwen", "qwen3": "qwen", "qwen3-max": "qwen", "qwen3.7-max": "qwen", "qwen3.7-plus": "qwen",
+    "qwen": "qwen", "qwen3": "qwen", "qwen3-max": "qwen",
+    _QWEN_MAX_MODEL: "qwen", _QWEN_PLUS_MODEL: "qwen",
 }
 
 # ── INTERPRET models (the 요청 해석 / "talk" LLM) ─────────────────────────────
@@ -78,7 +82,7 @@ _SCRIPT_ALIASES = {
 INTERPRET_MODELS: dict[str, dict[str, Any]] = {
     "qwen": {
         "id": "qwen", "label": "Qwen 3.7 Plus", "provider": "qwen",
-        "model": "qwen3.7-plus", "env": "DASHSCOPE_API_KEY", "status": "live",
+        "model": _QWEN_PLUS_MODEL, "env": "DASHSCOPE_API_KEY", "status": "live",
     },
     "sonnet": {
         "id": "sonnet", "label": "Claude (Sonnet 4.6)", "provider": "anthropic",
@@ -97,7 +101,7 @@ DEFAULT_INTERPRET_MODEL = "qwen"
 _INTERPRET_ALIASES = {
     "claude-sonnet-4-6": "sonnet", "sonnet": "sonnet", "claude": "sonnet", "anthropic": "sonnet",
     "gpt-4o-mini": "gpt_mini", "gpt4o-mini": "gpt_mini", "gpt_mini": "gpt_mini", "mini": "gpt_mini",
-    "qwen3.7-plus": "qwen", "qwen": "qwen",
+    _QWEN_PLUS_MODEL: "qwen", "qwen": "qwen",
 }
 
 # ── ASSET engines (per-beat visuals: image or video) ────────────────────────
@@ -191,7 +195,7 @@ def script_model_id(brief: dict[str, Any] | None) -> str:
     if mid == "claude":
         return _env_model("CLAUDE_SCRIPT_MODEL", "claude-opus-4-8")
     if mid == "qwen":
-        return _env_model("HIOB_QWEN_SCRIPT_MODEL", "qwen3.7-max")
+        return _env_model("HIOB_QWEN_SCRIPT_MODEL", _QWEN_MAX_MODEL)
     return SCRIPT_MODELS[mid]["model"]
 
 
@@ -263,13 +267,15 @@ def env_names_for_llm_model(model: str) -> tuple[str, ...]:
     """
     m = str(model or "").strip().lower()
     if m.startswith("claude"):
-        return ("ANTHROPIC_API_KEY",)
-    if m.startswith("qwen"):
-        return ("DASHSCOPE_API_KEY",)
-    if m.startswith("gemini"):
-        return ("GEMINI_API_KEY", "GOOGLE_API_KEY")
-    # OpenAI path (gpt-*, gpt-5.6-sol, and any unrouted default)
-    return ("OPENAI_API_KEY",)
+        names = ["ANTHROPIC_API_KEY"]
+    elif m.startswith("qwen"):
+        names = ["DASHSCOPE_API_KEY"]
+    elif m.startswith("gemini"):
+        names = ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+    else:
+        # OpenAI path (gpt-*, gpt-5.6-sol, and any unrouted default)
+        names = ["OPENAI_API_KEY"]
+    return tuple(names)
 
 
 def llm_api_key_present(model: str) -> bool:

@@ -9,6 +9,7 @@ APPROVED_SCRIPT_STATUSES = frozenset({"approved", "queued", "produced"})
 REQUIRED_PRODUCTION_WORK_KINDS = frozenset({"visual", "voiceover", "music", "sfx"})
 OPTIONAL_PRODUCTION_WORK_KINDS = frozenset({"caption", "title_style"})
 PRODUCTION_WORK_KINDS = REQUIRED_PRODUCTION_WORK_KINDS | OPTIONAL_PRODUCTION_WORK_KINDS
+_DATABASE_NOW = "now()"
 
 
 def get_run_script_status(client: Client, run_id: str) -> str | None:
@@ -62,12 +63,12 @@ def update_production_job(
         return {}
     payload: dict[str, Any] = {
         "status": status,
-        "updated_at": "now()",
+        "updated_at": _DATABASE_NOW,
     }
     if status == "running":
-        payload["started_at"] = "now()"
+        payload["started_at"] = _DATABASE_NOW
     if status in {"succeeded", "failed", "cancelled", "skipped"}:
-        payload["ended_at"] = "now()"
+        payload["ended_at"] = _DATABASE_NOW
     if span_id is not None:
         payload["span_id"] = span_id
     if modal_call_id is not None:
@@ -142,7 +143,7 @@ def maybe_mark_run_produced(client: Client, run_id: str) -> dict:
 
 
 def end_run(client: Client, run_id: str, status: str = "succeeded", **fields: Any) -> dict:
-    payload = {"status": status, "ended_at": "now()", **fields}
+    payload = {"status": status, "ended_at": _DATABASE_NOW, **fields}
     res = client.table("run").update(payload).eq("id", run_id).execute()
     return res.data[0] if res.data else {}
 
@@ -187,11 +188,22 @@ def end_span(
     error: dict | None = None,
     attributes_patch: dict | None = None,
 ) -> dict:
-    payload: dict[str, Any] = {"status": status, "ended_at": "now()"}
+    payload: dict[str, Any] = {"status": status, "ended_at": _DATABASE_NOW}
     if output_preview is not None:
         payload["output_preview"] = output_preview
     if error is not None:
         payload["error"] = error
+    if attributes_patch is not None:
+        rows = (
+            client.table("span")
+            .select("attributes")
+            .eq("id", span_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        current = dict(rows[0].get("attributes") or {}) if rows else {}
+        payload["attributes"] = {**current, **attributes_patch}
     res = client.table("span").update(payload).eq("id", span_id).execute()
     return res.data[0] if res.data else {}
 

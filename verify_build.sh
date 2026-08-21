@@ -33,7 +33,7 @@ echo "  ✅ All platform modules compile"
 # Step 3: Verify pyproject.toml well-formed
 echo ""
 echo "✓ Step 3: Package metadata"
-if [ -f pyproject.toml ]; then
+if [[ -f pyproject.toml ]]; then
   echo "  ✅ pyproject.toml found"
   grep -q 'name = "hiob-core"' pyproject.toml && echo "  ✅ Package name correct"
   grep -q 'version = "0.1.0"' pyproject.toml && echo "  ✅ Version set"
@@ -75,14 +75,14 @@ echo "  ✅ Found $CORE_PY_COUNT Python modules"
 echo ""
 echo "✓ Step 7: Copy fidelity check"
 ORIG_LLM_PATH="../../apps/modal/workers/llm_runtime.py"
-if [ -f "$ORIG_LLM_PATH" ]; then
+if [[ -f "$ORIG_LLM_PATH" ]]; then
   ORIG_LLM_SIZE=$(wc -l < "$ORIG_LLM_PATH")
   CORE_LLM_SIZE=$(wc -l < hiob_core/llm_runtime.py)
   echo "  Original llm_runtime.py:     $ORIG_LLM_SIZE lines"
   echo "  Copied hiob_core/llm_runtime.py: $CORE_LLM_SIZE lines"
   # Allow ±5 line difference (path adjustments, etc)
   DIFF=$((ORIG_LLM_SIZE - CORE_LLM_SIZE))
-  if [ $DIFF -lt 5 ] && [ $DIFF -gt -5 ]; then
+  if [[ $DIFF -lt 5 && $DIFF -gt -5 ]]; then
     echo "  ✅ Copy size within tolerance"
   else
     echo "  ⚠️ Warning: size difference = $DIFF lines (may be intentional adjustments)"

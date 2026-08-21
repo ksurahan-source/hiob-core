@@ -2,14 +2,20 @@
 name = "hiob-core"
 version = "0.1.0"
 description = "HIOB 공유 런타임 — LLM 런타임·모델 프로바이더·platform 헬퍼. 전 행성이 depend하는 published 패키지(폴리레포 substrate)."
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 # substrate = plain 이름(소비자 root sources가 git 해소). hiob-platform은 substrate 동급.
 dependencies = [
     "hiob-platform @ git+https://github.com/ksurahan-source/hiob-platform.git@8e4730d44084f7db2136891ef42c02921997dd13",
-    "httpx",
-    "openai",
-    "supabase",
+    "httpx>=0.28,<0.29",
+    "openai>=2,<3",
+    "supabase>=2,<3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.0.3",
+    "pytest-cov>=7,<8",
 ]
 
 [build-system]
